@@ -1,0 +1,30 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizard.settings.xml
+/.idea/
+.setting/
+.kotlin/
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Signing and local secrets
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+
+# Local capture/test media
+/local-captures/
+/test-captures/
+/reference-captures/

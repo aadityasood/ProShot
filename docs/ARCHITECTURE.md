@@ -1,0 +1,209 @@
+# ProShot — System Architecture
+
+## Overview
+
+ProShot provides a reference-grade computational photography pipeline on
+Android. The app captures multi-frame bursts, aligns and merges them for
+HDR/noise reduction, performs semantic scene analysis, and applies per-region
+enhancements with the ProShot Natural color profile.
+
+## Pipeline Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│              LAYER 1: CAPTURE                        │
+│  Camera2 API (Kotlin)                                │
+│  • Burst capture: 5 frames, bracketed exposure       │
+│  • Frame buffering (ring buffer of recent frames)    │
+│  • Sharpness-based reference frame selection         │
+│  • RAW (DNG) capture when available, YUV fallback    │
+│  Input: scene    Output: List<ImageFrame>             │
+└──────────────────────┬──────────────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────────────┐
+│              LAYER 2: ALIGNMENT & MERGING            │
+│  OpenCV + Custom C++ (NDK)                           │
+│  • Gaussian pyramid (4 levels) for coarse-to-fine    │
+│  • Tile-based motion estimation (16x16 → 8x8 tiles) │
+│  • Sub-pixel alignment via L2 distance matching      │
+│  • Adaptive temporal merging with ghost rejection    │
+│  Input: List<ImageFrame>  Output: MergedHDRImage     │
+└──────────────────────┬──────────────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────────────┐
+│              LAYER 3: SEMANTIC ANALYSIS              │
+│  MediaPipe + TFLite (Kotlin + GPU Delegate)          │
+│  • Face detection: BlazeFace (<1ms)                  │
+│  • Face landmarks: 478-point 3D mesh (~5ms)          │
+│  • Skin mask: polygon from face landmark subset      │
+│  • Person segmentation: selfie seg model (~8ms)      │
+│  • Scene classification: MobileNetV3 (~15ms)         │
+│  Input: MergedHDRImage  Output: SemanticMasks        │
+└──────────────────────┬──────────────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────────────┐
+│              LAYER 4: ENHANCEMENT                    │
+│  GPU Compute (AGSL / OpenGL ES 3.1)                  │
+│  • Per-region tone mapping (face, sky, background)   │
+│  • Skin-aware noise reduction                        │
+│     - Bilateral filter on skin (sigma_c=50, σ_s=15)  │
+│     - Non-local means on non-skin (h=10)             │
+│  • Face exposure optimization (target: 55-65% lum)   │
+│  • Shadow fill on faces (+20-30% lift, +3K warmth)   │
+│  • Adaptive sharpening (0 on skin, moderate elsewhere)│
+│  Input: MergedHDRImage + SemanticMasks               │
+│  Output: EnhancedImage                               │
+└──────────────────────┬──────────────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────────────┐
+│              LAYER 5: COLOR SCIENCE                   │
+│  Custom Processing (GPU)                              │
+│  • ProShot Natural tone curve (gentle S-curve)       │
+│     Blacks: +5, Shadows: +8%, Highlights: -5%        │
+│  • Color temperature: +3-5K global, +8-10K skin      │
+│  • Saturation: -5% overall, -10% skin, +15% sky     │
+│  • Skin tone protection (hue-locked in HSL)          │
+│  • Per-region color adjustment using semantic masks   │
+│  Input: EnhancedImage + SemanticMasks                │
+│  Output: FinalImage                                  │
+└──────────────────────┬──────────────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────────────┐
+│              LAYER 6: OUTPUT                          │
+│  • HEIF encoding (JPEG fallback)                     │
+│  • EXIF metadata preservation                        │
+│  • MediaStore integration (gallery visible)          │
+│  • Before/after comparison storage                   │
+└─────────────────────────────────────────────────────┘
+```
+
+> **Warmth-unit TODO:** The "+3-5K" and "+8-10K" values in Layer 5 above refer
+> to thousands of Kelvin (3,000–5,000 K shift). The `LookProfile` data contract
+> stores `globalWarmthShiftKelvin` and `RegionTuning.warmthShiftKelvin` as small
+> integers (e.g. 4, 8). Whether these integers represent true Kelvin deltas,
+> thousands of Kelvin, or product-relative slider units **must be resolved
+> before the color-science shader implementation consumes them**. See ledger
+> entry BL-D005.
+
+## Data Types
+
+```kotlin
+data class ImageFrame(
+    val buffer: ByteBuffer,       // RAW or YUV data
+    val width: Int,
+    val height: Int,
+    val format: Int,              // ImageFormat.RAW_SENSOR or YUV_420_888
+    val exposureNs: Long,         // Exposure time in nanoseconds
+    val iso: Int,                 // Sensor sensitivity
+    val sharpnessScore: Float,    // Laplacian variance
+    val timestamp: Long           // Capture timestamp
+)
+
+data class SemanticMasks(
+    val faceMasks: List<FaceMask>,  // Per-face masks
+    val skinMask: FloatArray,       // [0, 1] soft mask for skin regions
+    val skyMask: FloatArray,        // [0, 1] soft mask for sky
+    val personMask: FloatArray,     // [0, 1] soft mask for person(s)
+    val sceneType: SceneType        // INDOOR, OUTDOOR_DAY, OUTDOOR_NIGHT, etc.
+)
+
+data class FaceMask(
+    val boundingBox: RectF,
+    val landmarks: List<PointF>,    // 478 landmarks
+    val skinRegion: FloatArray,     // Soft mask for this face's skin
+    val meanLuminance: Float        // Average brightness of face region
+)
+
+sealed class SceneType {
+    object IndoorWarm : SceneType()
+    object IndoorCool : SceneType()
+    object OutdoorDay : SceneType()
+    object OutdoorGoldenHour : SceneType()
+    object OutdoorNight : SceneType()
+    object Portrait : SceneType()
+    object Landscape : SceneType()
+}
+```
+
+## Key Algorithms
+
+### Frame Selection (Sharpness Scoring)
+```
+For each captured frame:
+  1. Convert to grayscale
+  2. Apply 3x3 Laplacian kernel
+  3. sharpnessScore = variance(laplacian_output)
+  4. Reference frame = argmax(sharpnessScore)
+```
+
+### Skin Tone Protection
+```
+For each pixel in skin mask region:
+  1. Convert RGB → HSL
+  2. Store original hue (H_orig)
+  3. Apply all tone/contrast adjustments in L and S channels
+  4. Restore H = H_orig (hue lock)
+  5. Clamp S adjustment to ±10% of original
+  6. Convert HSL → RGB
+```
+
+### ProShot Natural Tone Curve
+```
+Control points (input → output, 0-255 range):
+  (0, 5)       — slight black lift
+  (32, 38)     — shadow lift
+  (64, 72)     — lower-mid lift
+  (128, 132)   — midtone subtle boost
+  (192, 188)   — highlight gentle compression
+  (224, 218)   — upper highlight rolloff
+  (255, 250)   — white point soft clip
+Interpolation: cubic spline
+```
+
+## Dependencies
+
+| Library | Version | Purpose |
+|:---|:---|:---|
+| CameraX | 1.4.x | Preview rendering |
+| Camera2 | platform | Burst capture control |
+| OpenCV Android | 4.9.x | Frame alignment (NDK) |
+| TensorFlow Lite | 2.16.x | ML model inference |
+| MediaPipe Tasks | 0.10.x | Face detection, landmarks |
+| Hilt | 2.51.x | Dependency injection |
+| Jetpack Compose | 1.7.x | UI framework |
+| Material3 | 1.3.x | Design system |
+| Coil | 2.7.x | Image loading in gallery |
+| Room | 2.6.x | Photo metadata database |
+
+## Performance Targets
+
+| Operation | Budget | Hardware |
+|:---|:---|:---|
+| Burst capture (5 frames) | <500ms | Camera sensor |
+| Frame alignment | <300ms | CPU (OpenCV NDK) |
+| Frame merging | <200ms | GPU (Vulkan/GLES) |
+| Semantic analysis | <50ms | NPU/GPU (TFLite) |
+| Enhancement | <150ms | GPU (AGSL) |
+| Color science | <50ms | GPU |
+| **Total** | **<1.5s** | |
+
+## Graceful Degradation
+
+Graceful degradation preserves the selected look profile. The app may reduce
+capture cost, processing precision, or acceleration, but it should not fall back
+to a generic Android-camera look when a valid image buffer exists.
+
+| Capability Missing | Fallback | Look Rule |
+|:---|:---|:---|
+| Full RAW/manual/burst support available | `FULL_COMPUTATIONAL` | Full pipeline with selected look profile |
+| No RAW support | `YUV_BURST` using YUV_420_888 | Same ProShot Natural look profile |
+| Camera2 LEGACY or external camera level | `SINGLE_FRAME_ENHANCED` | Single frame still receives tone/color/skin treatment |
+| No burst support | `SINGLE_FRAME_ENHANCED` | Preserve ProShot Natural tone curve and warmth |
+| No GPU delegate | CPU processing fallback | Same look, slower execution |
+| Low memory (<3GB) | Reduce burst count or single-frame enhanced path | Same look, lower cost |
+| No face detected | Skip face-specific processing, apply global and available regional tuning | Same look without face-only adjustments |
+| Processing timeout (>3s) | Skip alignment, apply color science only | Same look profile on the best available frame |
+| Camera unavailable or no usable image buffer | `BASIC_CAPTURE` | Emergency path; apply minimal look transform if a frame exists |
+
+`CompatibilityPolicy` owns the tier decision so device-specific workarounds stay
+out of core capture and processing algorithms.
