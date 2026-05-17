@@ -1,29 +1,42 @@
 package com.proshot.app
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import com.proshot.app.ui.CameraScreen
 import dagger.hilt.android.AndroidEntryPoint
+
+private const val TAG = "MainActivity"
 
 /**
  * Main activity for the ProShot camera application.
- * Currently serves as an empty shell for the Compose-based UI.
- *
- * TODO: Remove stringFromJNI() and Greeting() after NDK smoke test is verified.
- *       These are temporary build-verification stubs (will be replaced in T02).
+ * Boots the unified CameraScreen viewfinder to handle permission checks and live views.
  */
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
     companion object {
+        /**
+         * Whether the native library loaded successfully. `false` when the NDK
+         * pipeline has not been built yet (T01-D003).
+         */
+        @JvmStatic
+        val nativeLibraryAvailable: Boolean
+
         init {
-            System.loadLibrary("proshot")
+            nativeLibraryAvailable = try {
+                System.loadLibrary("proshot")
+                true
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(TAG, "Native library 'proshot' not available; NDK features disabled.", e)
+                false
+            }
         }
     }
 
@@ -32,12 +45,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             // TODO(T22): Replace ProShotTheme with full custom theme from Theme.kt
             ProShotTheme {
-                // A surface container using the 'background' color from the theme
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    Greeting(stringFromJNI())
+                    CameraScreen()
                 }
             }
         }
@@ -48,14 +60,6 @@ class MainActivity : ComponentActivity() {
      * which is packaged with this application.
      */
     external fun stringFromJNI(): String
-}
-
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Welcome to $name!",
-        modifier = modifier
-    )
 }
 
 /**
