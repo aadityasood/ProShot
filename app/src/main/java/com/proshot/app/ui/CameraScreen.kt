@@ -47,11 +47,14 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.proshot.app.camera.CameraCapabilitiesMapper
+import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
 import com.proshot.app.camera.compat.DeviceCameraCapabilities
+import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
@@ -195,9 +198,14 @@ private fun ActivePreviewContent(
     // Remembered reference to the camera provider for cleanup in DisposableEffect.
     var cameraProvider: ProcessCameraProvider? by remember { mutableStateOf(null) }
 
+    var previewTrigger by remember { mutableIntStateOf(0) }
+    var isCapturing by remember { mutableStateOf(false) }
+    var captureStatusMessage by remember { mutableStateOf("Idle - Tap Shutter to capture YUV") }
+    val scope = rememberCoroutineScope()
+
     // Resolve ProcessCameraProvider off the main thread using cancellable coroutine.
     // This replaces the uncancellable addListener pattern.
-    LaunchedEffect(lifecycleOwner, previewView) {
+    LaunchedEffect(lifecycleOwner, previewView, previewTrigger) {
         try {
             val provider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
                 val future = ProcessCameraProvider.getInstance(context)
@@ -252,12 +260,6 @@ private fun ActivePreviewContent(
         }
     }
 
-    // Render live CameraX preview
-    AndroidView(
-        factory = { previewView },
-        modifier = Modifier.fillMaxSize()
-    )
-
     var capabilityState by remember(context) {
         mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
     }
@@ -271,11 +273,90 @@ private fun ActivePreviewContent(
         }
     }
 
-    // TODO(REMOVE BEFORE RELEASE): Debug-only status overlay.
-    // This overlay is a temporary diagnostic aid for development and device testing.
-    // It must be removed or gated behind a debug build flag before any external release.
-    capabilityState?.let { (capabilities, decision) ->
-        DebugStatusOverlay(capabilities, decision)
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Render live CameraX preview
+        AndroidView(
+            factory = { previewView },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // TODO(REMOVE BEFORE RELEASE): Debug-only status overlay.
+        // This overlay is a temporary diagnostic aid for development and device testing.
+        // It must be removed or gated behind a debug build flag before any external release.
+        capabilityState?.let { (capabilities, decision) ->
+            DebugStatusOverlay(capabilities, decision)
+        }
+
+        // Minimal capture state and shutter UI
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(16.dp)
+                .background(Color.Black.copy(alpha = 0.7f))
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "State: ${if (isCapturing) "Capturing" else "Idle"}",
+                color = if (isCapturing) Color.Yellow else Color.Green,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = captureStatusMessage,
+                color = Color.White,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    if (isCapturing) return@Button
+                    isCapturing = true
+                    captureStatusMessage = "Initiating capture..."
+                    scope.launch {
+                        try {
+                            // 1. Explicitly unbind all CameraX use cases from the provider on Main thread
+                            withContext(Dispatchers.Main) {
+                                cameraProvider?.unbindAll()
+                            }
+
+                            // 2. Call Camera2 raw capture on background dispatcher
+                            val frame = withContext(Dispatchers.Default) {
+                                SingleFrameCaptureController.captureSingleFrame(context)
+                            }
+
+                            // 3. Eagerly summarize
+                            val summary = SingleFrameCaptureController.summarizeFrame(frame)
+                            captureStatusMessage = summary.getFormattedSummary()
+                        } catch (e: CancellationException) {
+                            captureStatusMessage = "Capture cancelled."
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Single frame capture failed", e)
+                            captureStatusMessage = "Error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                        } finally {
+                            isCapturing = false
+                            // 4. Guaranteed preview rebound by incrementing reactive key
+                            previewTrigger++
+                        }
+                    }
+                },
+                enabled = !isCapturing && cameraProvider != null
+            ) {
+                if (isCapturing) {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        modifier = Modifier.height(18.dp)
+                    )
+                } else if (cameraProvider == null) {
+                    Text("WAITING")
+                } else {
+                    Text("SHUTTER")
+                }
+            }
+        }
     }
 }
 
@@ -372,7 +453,7 @@ private fun PermissionDeniedView(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "ProShot needs camera permissions to capture and process premium computational photography frames.",
+                text = "ProShot needs camera permission to capture photos.",
                 color = Color.Gray,
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center
