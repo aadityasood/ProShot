@@ -131,4 +131,69 @@ class CopiedImageFrameTest {
         // Verify original heap buffer position is untouched
         assertEquals(0, heapBuffer.position())
     }
+
+    @Test
+    fun findClosestStableSize_selectsClosestTo1080p() {
+        val sizes = listOf(
+            CaptureSize(1280, 720),    // area = 921,600 (diff = 1,152,000)
+            CaptureSize(1920, 1080),   // area = 2,073,600 (diff = 0)
+            CaptureSize(3840, 2160),   // area = 8,294,400 (diff = 6,220,800)
+            CaptureSize(640, 480)      // area = 307,200 (diff = 1,766,400)
+        )
+
+        val selected = SingleFrameCaptureController.findClosestStableSize(sizes)
+        assertEquals(1920, selected.width)
+        assertEquals(1080, selected.height)
+    }
+
+    @Test
+    fun findClosestStableSize_emptyListReturnsFallback() {
+        val selected = SingleFrameCaptureController.findClosestStableSize(emptyList())
+        assertEquals(1920, selected.width)
+        assertEquals(1080, selected.height)
+    }
+
+    @Test
+    fun findClosestStableSize_selectsClosestAreaWhenNoExact1080p() {
+        val sizes = listOf(
+            CaptureSize(1600, 1200),   // area = 1,920,000 (diff = 153,600) -> closest!
+            CaptureSize(2560, 1440),   // area = 3,686,400 (diff = 1,612,800)
+            CaptureSize(800, 600)      // area = 480,000
+        )
+
+        val selected = SingleFrameCaptureController.findClosestStableSize(sizes)
+        assertEquals(1600, selected.width)
+        assertEquals(1200, selected.height)
+    }
+
+    @Test
+    fun summarizeFrame_producesValidSummary() {
+        val planeY = CopiedPlane(rowStride = 100, pixelStride = 1, data = ByteArray(100))
+        val planeU = CopiedPlane(rowStride = 50, pixelStride = 2, data = ByteArray(50))
+        val planeV = CopiedPlane(rowStride = 50, pixelStride = 2, data = ByteArray(50))
+
+        val frame = CopiedImageFrame(
+            format = CameraCapabilitiesMapper.FORMAT_YUV_420_888,
+            width = 100,
+            height = 100,
+            timestamp = 987654321L,
+            planes = listOf(planeY, planeU, planeV)
+        )
+
+        val summary = SingleFrameCaptureController.summarizeFrame(frame)
+        assertEquals(100, summary.width)
+        assertEquals(100, summary.height)
+        assertEquals(987654321L, summary.timestampNs)
+        assertEquals("YUV_420_888", summary.formatName)
+        assertEquals(100, summary.yPlaneSize)
+        assertEquals(50, summary.uPlaneSize)
+        assertEquals(50, summary.vPlaneSize)
+
+        val formatted = summary.getFormattedSummary()
+        assertTrue(formatted.contains("Res: 100x100"))
+        assertTrue(formatted.contains("Time: 987654321ns"))
+        assertTrue(formatted.contains("Y: 100"))
+        assertTrue(formatted.contains("U: 50"))
+        assertTrue(formatted.contains("V: 50"))
+    }
 }

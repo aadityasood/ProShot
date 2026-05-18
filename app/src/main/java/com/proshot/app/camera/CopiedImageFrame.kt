@@ -56,6 +56,13 @@ interface ImageSource {
 
 /**
  * Platform implementation of [ImageSource] wrapping an [android.media.Image].
+ *
+ * **Lifecycle constraint:** instances of this class hold direct [java.nio.ByteBuffer]
+ * references into the native [Image] planes. These references are only valid while
+ * the underlying [Image] is open. Do not pass an [AndroidImageSource] across suspension
+ * points, to another coroutine, or beyond the enclosing `try` block that holds the
+ * [Image] open. Use [CopiedImageFrame.copyFrom] to create a safe heap copy before
+ * closing the [Image].
  */
 class AndroidImageSource(private val image: Image) : ImageSource {
     override val format: Int get() = image.format
