@@ -50,6 +50,7 @@ import com.proshot.app.camera.CameraCapabilitiesMapper
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
 import com.proshot.app.camera.compat.DeviceCameraCapabilities
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -186,25 +187,30 @@ private fun ActivePreviewContent(
     lifecycleOwner: androidx.lifecycle.LifecycleOwner,
     onCameraError: (String) -> Unit
 ) {
-    var previewView: PreviewView? by remember { mutableStateOf(null) }
+    val previewView = remember(context) {
+        PreviewView(context).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+    }
     // Remembered reference to the camera provider for cleanup in DisposableEffect.
     var cameraProvider: ProcessCameraProvider? by remember { mutableStateOf(null) }
 
     // Resolve ProcessCameraProvider off the main thread using cancellable coroutine.
     // This replaces the uncancellable addListener pattern.
     LaunchedEffect(lifecycleOwner, previewView) {
-        val view = previewView ?: return@LaunchedEffect
         try {
-            val provider = suspendCancellableCoroutine { cont ->
+            val provider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
                 val future = ProcessCameraProvider.getInstance(context)
-                cont.invokeOnCancellation {
-                    future.cancel(true)
-                }
                 future.addListener({
+                    if (!cont.isActive) {
+                        return@addListener
+                    }
                     try {
                         cont.resume(future.get())
                     } catch (e: Exception) {
-                        cont.resumeWithException(e)
+                        if (cont.isActive) {
+                            cont.resumeWithException(e)
+                        }
                     }
                 }, ContextCompat.getMainExecutor(context))
             }
@@ -213,7 +219,7 @@ private fun ActivePreviewContent(
             provider.unbindAll()
 
             val previewUseCase = Preview.Builder().build().also {
-                it.setSurfaceProvider(view.surfaceProvider)
+                it.setSurfaceProvider(previewView.surfaceProvider)
             }
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
@@ -222,6 +228,9 @@ private fun ActivePreviewContent(
                 cameraSelector,
                 previewUseCase
             )
+        } catch (e: CancellationException) {
+            Log.d(TAG, "CameraX preview binding cancelled during lifecycle change", e)
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind CameraX preview", e)
             onCameraError(e.localizedMessage ?: "Unknown CameraX bind error")
@@ -241,12 +250,7 @@ private fun ActivePreviewContent(
 
     // Render live CameraX preview
     AndroidView(
-        factory = { ctx ->
-            PreviewView(ctx).apply {
-                scaleType = PreviewView.ScaleType.FILL_CENTER
-                previewView = this
-            }
-        },
+        factory = { previewView },
         modifier = Modifier.fillMaxSize()
     )
 
