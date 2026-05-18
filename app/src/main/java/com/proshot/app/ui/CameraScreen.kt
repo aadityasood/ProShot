@@ -201,6 +201,9 @@ private fun ActivePreviewContent(
         try {
             val provider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
                 val future = ProcessCameraProvider.getInstance(context)
+                // Do not register invokeOnCancellation { future.cancel(...) } here.
+                // CameraX exposes a shared provider future; cancelling it can break
+                // later provider resolution. Instead, guard inactive continuations.
                 future.addListener({
                     if (!cont.isActive) {
                         return@addListener
@@ -237,7 +240,8 @@ private fun ActivePreviewContent(
         }
     }
 
-    // Cleanup: unbind all CameraX use cases when leaving composition.
+    // Keyed on lifecycleOwner only: LaunchedEffect unbinds before every rebind.
+    // This effect is final cleanup when the preview leaves composition entirely.
     DisposableEffect(lifecycleOwner) {
         onDispose {
             try {
