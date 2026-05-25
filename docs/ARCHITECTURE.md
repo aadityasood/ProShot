@@ -82,8 +82,7 @@ enhancements with the ProShot Natural color profile.
 > stores `globalWarmthShiftKelvin` and `RegionTuning.warmthShiftKelvin` as small
 > integers (e.g. 4, 8). Whether these integers represent true Kelvin deltas,
 > thousands of Kelvin, or product-relative slider units **must be resolved
-> before the color-science shader implementation consumes them**. See ledger
-> entry BL-D005.
+> before the color-science shader implementation consumes them**.
 
 ## Data Types
 

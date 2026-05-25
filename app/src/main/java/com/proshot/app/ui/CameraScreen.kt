@@ -51,6 +51,9 @@ import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
 import com.proshot.app.camera.compat.DeviceCameraCapabilities
+import com.proshot.app.output.CapturedImageEncoder
+import com.proshot.app.output.GalleryImageSaver
+import com.proshot.app.output.GallerySaveResult
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -326,16 +329,48 @@ private fun ActivePreviewContent(
                             val frame = withContext(Dispatchers.Default) {
                                 SingleFrameCaptureController.captureSingleFrame(context)
                             }
+                            val outputRotationDegrees = withContext(Dispatchers.IO) {
+                                SingleFrameCaptureController.resolveOutputRotationDegrees(context)
+                            }
 
-                            // 3. Eagerly summarize
-                            val summary = SingleFrameCaptureController.summarizeFrame(frame)
-                            captureStatusMessage = summary.getFormattedSummary()
+                            // 3. Encode captured frame to NV21 & JPEG on Dispatchers.Default
+                            captureStatusMessage = "Encoding captured frame..."
+                            val jpegBytes = withContext(Dispatchers.Default) {
+                                val nv21 = CapturedImageEncoder.yuv420ToNv21(frame)
+                                val orientedNv21 = CapturedImageEncoder.rotateNv21(
+                                    nv21 = nv21,
+                                    width = frame.width,
+                                    height = frame.height,
+                                    rotationDegrees = outputRotationDegrees
+                                )
+                                CapturedImageEncoder.compressNv21ToJpeg(
+                                    nv21 = orientedNv21.data,
+                                    width = orientedNv21.width,
+                                    height = orientedNv21.height
+                                )
+                            }
+
+                            // 4. Save JPEG to gallery on Dispatchers.IO
+                            captureStatusMessage = "Saving to gallery..."
+                            val saveResult = GalleryImageSaver.saveToGallery(context, jpegBytes)
+
+                            // 5. Update user status message
+                            captureStatusMessage = when (saveResult) {
+                                is GallerySaveResult.Success -> "Saved to gallery"
+                                is GallerySaveResult.Failure -> "Save failed: ${saveResult.userReason}"
+                            }
                         } catch (e: CancellationException) {
                             captureStatusMessage = "Capture cancelled."
                             throw e
+                        } catch (e: IllegalArgumentException) {
+                            Log.e(TAG, "Frame verification failed", e)
+                            captureStatusMessage = "Capture failed: invalid image data"
+                        } catch (e: OutOfMemoryError) {
+                            Log.e(TAG, "OOM during capture/encode; frame too large for available memory", e)
+                            captureStatusMessage = "Not enough memory to save photo"
                         } catch (e: Exception) {
-                            Log.e(TAG, "Single frame capture failed", e)
-                            captureStatusMessage = "Error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                            Log.e(TAG, "Single frame capture or encode failed", e)
+                            captureStatusMessage = "Capture failed: system error"
                         } finally {
                             isCapturing = false
                             // 4. Guaranteed preview rebound by incrementing reactive key

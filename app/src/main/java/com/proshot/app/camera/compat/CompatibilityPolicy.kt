@@ -75,12 +75,12 @@ object CompatibilityPolicy {
     private const val FULL_BURST_COUNT = 5
     private const val SINGLE_FRAME_COUNT = 1
     private const val NO_CAPTURE_FRAMES = 0
-    // TODO(BL-D004): LOW_MEMORY_THRESHOLD_MB uses per-process heap class (ActivityManager
+    // TODO: LOW_MEMORY_THRESHOLD_MB uses per-process heap class (ActivityManager
     // .memoryClass), not total device RAM. ARCHITECTURE.md line 195 specifies <3 GB total RAM
     // as the low-memory trigger. These are different APIs measuring different things. The
     // lowRamDevice flag captures OEM-flagged low-RAM correctly, but this numeric threshold
     // needs validation against the real device matrix before it can be treated as a stable
-    // product decision. See ledger entry BL-D004.
+    // product decision.
     private const val LOW_MEMORY_THRESHOLD_MB = 256
 
     /**

@@ -35,7 +35,7 @@ data class ToneCurvePoint(
  * directly by the color-science shader. The unit interpretation (true Kelvin
  * delta vs. product-relative slider unit) must be agreed upon before the
  * first shader implementation consumes this contract. See the warmth-unit
- * TODO in `ARCHITECTURE.md` and ledger entry BL-D005.
+ * TODO in `ARCHITECTURE.md`.
  */
 data class RegionTuning(
     val exposureLift: Float,
