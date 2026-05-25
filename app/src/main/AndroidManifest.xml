@@ -5,12 +5,11 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- API 26–28: legacy external storage write access. Dropped on API 29+ (scoped storage). -->
+    <!-- API 26-28: legacy external storage write access. Dropped on API 29+ (scoped storage). -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
-    <!-- API 26–32: legacy external storage read access. Superseded by READ_MEDIA_IMAGES on API 33+. -->
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <!-- API 33+: granular media permission for reading images from shared storage. -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- READ_EXTERNAL_STORAGE and READ_MEDIA_IMAGES are intentionally omitted:
+         T04 saves app-owned photos via MediaStore.insert which does not require read access.
+         Add them back only when a gallery browsing or image picker feature is introduced. -->
 
     <application
         android:name=".ProShotApplication"

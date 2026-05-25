@@ -202,7 +202,7 @@ object CameraCapabilitiesMapper {
      * capture flags to `false`, routing through `BASIC_CAPTURE`.
      *
      * Note: This fallback is used both for genuine "no camera" devices and for
-     * transient HAL exceptions. A future refinement (see ledger T02-D004) may
+     * transient HAL exceptions. A future refinement may
      * differentiate these cases to avoid over-degrading devices that experience
      * a one-time HAL crash at cold boot.
      */

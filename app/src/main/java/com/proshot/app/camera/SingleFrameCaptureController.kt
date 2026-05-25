@@ -9,12 +9,16 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.media.Image
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
+import android.view.Surface
+import android.view.WindowManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -27,7 +31,9 @@ import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 
 private const val TAG = "SingleFrameCaptureController"
-private const val CAPTURE_TIMEOUT_MS = 5_000L
+private const val CAPTURE_TIMEOUT_MS = 8_000L
+private const val AE_WARMUP_MIN_FRAMES = 3
+private const val AE_WARMUP_MAX_FRAMES = 12
 
 /**
  * Represent standard image dimension in a pure Kotlin format to enable robust
@@ -60,7 +66,7 @@ data class CapturedFrameSummary(
  * Controller that coordinates Camera2 physical resources to capture a single YUV_420_888
  * frame and safely copy it to heap memory. Runs entirely on background threads.
  *
- * TODO: Convert to Hilt-injectable class before burst-capture routing is added (see BL-D012).
+ * TODO: Convert to Hilt-injectable class before burst-capture routing is added.
  */
 object SingleFrameCaptureController {
 
@@ -94,6 +100,29 @@ object SingleFrameCaptureController {
     }
 
     /**
+     * Resolves the clockwise pixel rotation needed for saved output to match device orientation.
+     *
+     * For front cameras, this returns the correct rotation angle, but the caller must also
+     * apply a horizontal flip before encoding, as Camera2 front-camera buffers are not
+     * pre-mirrored. See Camera2 documentation on LENS_FACING_FRONT sensor orientation.
+     */
+    fun resolveOutputRotationDegrees(context: Context): Int {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: throw IllegalStateException("CameraManager is not available")
+        val cameraId = resolvePrimaryCameraId(manager)
+        val characteristics = manager.getCameraCharacteristics(cameraId)
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+        val displayRotationDegrees = displayRotationDegrees(context)
+
+        return if (lensFacing == CameraMetadata.LENS_FACING_FRONT) {
+            (sensorOrientation + displayRotationDegrees) % 360
+        } else {
+            (sensorOrientation - displayRotationDegrees + 360) % 360
+        }
+    }
+
+    /**
      * Captures a single YUV_420_888 frame from the primary back camera and returns a safe heap-allocated [CopiedImageFrame].
      *
      * Ensures all native and physical resources (CameraDevice, CameraCaptureSession, ImageReader, HandlerThread)
@@ -115,11 +144,7 @@ object SingleFrameCaptureController {
             ?: throw IllegalStateException("CameraManager is not available")
 
         // 1. Resolve primary physical back camera
-        val cameraId = manager.cameraIdList.firstOrNull { id ->
-            val chars = manager.getCameraCharacteristics(id)
-            chars.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
-        } ?: manager.cameraIdList.firstOrNull()
-          ?: throw IllegalStateException("No physical camera detected on this device")
+        val cameraId = resolvePrimaryCameraId(manager)
 
         val characteristics = manager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -184,17 +209,17 @@ object SingleFrameCaptureController {
                 cont.invokeOnCancellation {
                     Log.d(TAG, "Camera open cancelled, closing camera device")
                     pendingDevice.get()?.close()
-                    // Do NOT quit the handler thread here — the Camera2 open callback
+                    // Do NOT quit the handler thread here. The Camera2 open callback
                     // may still need the looper to deliver and close a late-opened device.
                     // The finally block handles handlerThread.quitSafely().
                 }
             }
 
             // 4. Initialize ImageReader
-            imageReader = ImageReader.newInstance(targetSize.width, targetSize.height, ImageFormat.YUV_420_888, 1)
+            imageReader = ImageReader.newInstance(targetSize.width, targetSize.height, ImageFormat.YUV_420_888, 4)
 
             // 5. Create CameraCaptureSession and wait for it to configure
-            // TODO(BL-D010): Migrate to createCaptureSession(SessionConfiguration) before
+            // TODO: Migrate to createCaptureSession(SessionConfiguration) before
             // burst-capture task. The deprecated overload is still functional on minSdk 26.
             @Suppress("DEPRECATION")
             captureSession = suspendCancellableCoroutine { cont ->
@@ -237,7 +262,7 @@ object SingleFrameCaptureController {
                 }
             }
 
-            // 6. Capture frame and copy to heap in listener
+            // 6. Run a short YUV drain before still capture so Camera2 AE can settle.
             val reader = imageReader
             val device = cameraDevice
             val session = captureSession
@@ -245,6 +270,13 @@ object SingleFrameCaptureController {
             if (device == null || session == null) {
                 throw IllegalStateException("Camera2 capture resources were not fully initialized")
             }
+
+            warmUpAutoExposure(
+                device = device,
+                session = session,
+                reader = reader,
+                handler = handler
+            )
 
             suspendCancellableCoroutine<CopiedImageFrame> { cont ->
                 reader.setOnImageAvailableListener({ imageReaderRef ->
@@ -308,7 +340,147 @@ object SingleFrameCaptureController {
             } catch (e: Exception) {
                 Log.w(TAG, "Error closing ImageReader", e)
             }
+            // TODO: The quitSafely() here can race with a late Camera2 onOpened callback
+            // that hasn't been delivered yet. If the looper exits before the callback runs,
+            // the late-opened CameraDevice may never receive its close(). The AtomicReference
+            // + onOpened guard handles most cases, but a truly delayed HAL delivery could be
+            // suppressed. A full fix requires a resource owner that defers looper shutdown
+            // until the open callback is confirmed delivered or timed out.
             handlerThread.quitSafely()
+        }
+    }
+
+    private suspend fun warmUpAutoExposure(
+        device: CameraDevice,
+        session: CameraCaptureSession,
+        reader: ImageReader,
+        handler: Handler
+    ) {
+        suspendCancellableCoroutine<Unit> { cont ->
+            val isWarmupDone = AtomicBoolean(false)
+            var frameCount = 0
+
+            fun finishWarmup() {
+                if (!isWarmupDone.compareAndSet(false, true)) {
+                    return
+                }
+                try {
+                    session.stopRepeating()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to stop AE warmup repeating request", e)
+                }
+                // Drain while the listener is still active, so late-arriving warm-up
+                // frames are handled by the drain callback rather than piling up
+                // unacquired in the ImageReader. Remove listener only after drain.
+                drainImageReader(reader)
+                reader.setOnImageAvailableListener(null, null)
+                if (cont.isActive) {
+                    cont.resume(Unit)
+                }
+            }
+
+            reader.setOnImageAvailableListener({ imageReaderRef ->
+                drainImageReader(imageReaderRef)
+            }, handler)
+
+            val warmupRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            }
+
+            val callback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: android.hardware.camera2.TotalCaptureResult
+                ) {
+                    frameCount++
+                    val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                    val aeReady = aeState == null ||
+                        aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                        aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                        aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
+
+                    if ((frameCount >= AE_WARMUP_MIN_FRAMES && aeReady) ||
+                        frameCount >= AE_WARMUP_MAX_FRAMES
+                    ) {
+                        finishWarmup()
+                    }
+                }
+
+                override fun onCaptureFailed(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: android.hardware.camera2.CaptureFailure
+                ) {
+                    Log.w(TAG, "AE warmup frame failed: ${failure.reason}")
+                    frameCount++
+                    if (frameCount >= AE_WARMUP_MAX_FRAMES) {
+                        finishWarmup()
+                    }
+                }
+            }
+
+            try {
+                session.setRepeatingRequest(warmupRequest.build(), callback, handler)
+            } catch (e: Exception) {
+                reader.setOnImageAvailableListener(null, null)
+                if (cont.isActive) {
+                    cont.resumeWithException(e)
+                }
+            }
+
+            cont.invokeOnCancellation {
+                if (isWarmupDone.compareAndSet(false, true)) {
+                    try {
+                        session.stopRepeating()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Unable to stop cancelled AE warmup", e)
+                    }
+                    drainImageReader(reader)
+                    reader.setOnImageAvailableListener(null, null)
+                }
+            }
+        }
+    }
+
+    private fun drainImageReader(reader: ImageReader) {
+        while (true) {
+            val image = try {
+                // acquireNextImage() drains FIFO without auto-discarding intermediate
+                // frames, making the drain deterministic regardless of queue depth.
+                reader.acquireNextImage()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Unable to drain ImageReader", e)
+                null
+            } ?: break
+            image.close()
+        }
+    }
+
+    private fun resolvePrimaryCameraId(manager: CameraManager): String {
+        return manager.cameraIdList.firstOrNull { id ->
+            val chars = manager.getCameraCharacteristics(id)
+            chars.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
+        } ?: manager.cameraIdList.firstOrNull()
+          ?: throw IllegalStateException("No physical camera detected on this device")
+    }
+
+    private fun displayRotationDegrees(context: Context): Int {
+        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            @Suppress("DEPRECATION")
+            windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        }
+        return when (rotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
         }
     }
 }
