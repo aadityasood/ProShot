@@ -58,3 +58,28 @@ Size guardrails:
 
 Any task that adds ML models, native libraries, or profile assets should report
 the expected install-size impact before merge.
+
+## Privacy And Photo Safety
+
+ProShot should protect user photos by design, while staying honest about the
+limits of app-level security. Captures are processed locally by default, but
+once a photo is saved to the device gallery, access is governed by Android, the
+gallery app, user-granted permissions, device security, and any user-enabled
+cloud backup.
+
+Privacy guardrails:
+
+- Do not add the `INTERNET` permission unless a future feature has explicit
+  user value, consent, and a privacy impact note.
+- Do not request gallery read permissions unless a real gallery browsing,
+  import, or before/after review feature needs them.
+- Do not upload images, process images in the cloud, or run image-content
+  analytics by default.
+- Do not log raw image buffers, JPEG bytes, gallery paths, EXIF dumps, or other
+  photo-derived payloads.
+- Keep beginner-facing privacy language clear: local-first and
+  permission-minimal, without promising absolute security.
+
+Any new permission, network feature, analytics SDK, crash-reporting SDK,
+backup behavior, sharing/export flow, or cloud feature must include a privacy
+impact note before merge.

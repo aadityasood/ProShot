@@ -54,6 +54,7 @@ import com.proshot.app.camera.compat.DeviceCameraCapabilities
 import com.proshot.app.output.CapturedImageEncoder
 import com.proshot.app.output.GalleryImageSaver
 import com.proshot.app.output.GallerySaveResult
+import com.proshot.app.processing.colorscience.LookProfileNv21Processor
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -316,6 +317,8 @@ private fun ActivePreviewContent(
             Button(
                 onClick = {
                     if (isCapturing) return@Button
+                    val activeDecision = capabilityState?.second ?: return@Button
+                    val lookProfile = activeDecision.lookProfile
                     isCapturing = true
                     captureStatusMessage = "Initiating capture..."
                     scope.launch {
@@ -333,28 +336,38 @@ private fun ActivePreviewContent(
                                 SingleFrameCaptureController.resolveOutputRotationDegrees(context)
                             }
 
-                            // 3. Encode captured frame to NV21 & JPEG on Dispatchers.Default
+                            // 3. Encode captured frame to NV21 & orient it on Dispatchers.Default
                             captureStatusMessage = "Encoding captured frame..."
-                            val jpegBytes = withContext(Dispatchers.Default) {
+                            val orientedNv21 = withContext(Dispatchers.Default) {
                                 val nv21 = CapturedImageEncoder.yuv420ToNv21(frame)
-                                val orientedNv21 = CapturedImageEncoder.rotateNv21(
+                                CapturedImageEncoder.rotateNv21(
                                     nv21 = nv21,
                                     width = frame.width,
                                     height = frame.height,
                                     rotationDegrees = outputRotationDegrees
                                 )
+                            }
+
+                            // 4. Apply ProShot Natural v0 processing hook on Dispatchers.Default
+                            captureStatusMessage = "Processing photo..."
+                            val processedNv21 = withContext(Dispatchers.Default) {
+                                LookProfileNv21Processor.apply(orientedNv21, lookProfile)
+                            }
+
+                            // 5. Compress processed NV21 to JPEG on Dispatchers.Default
+                            val jpegBytes = withContext(Dispatchers.Default) {
                                 CapturedImageEncoder.compressNv21ToJpeg(
-                                    nv21 = orientedNv21.data,
-                                    width = orientedNv21.width,
-                                    height = orientedNv21.height
+                                    nv21 = processedNv21.data,
+                                    width = processedNv21.width,
+                                    height = processedNv21.height
                                 )
                             }
 
-                            // 4. Save JPEG to gallery on Dispatchers.IO
+                            // 6. Save JPEG to gallery on Dispatchers.IO
                             captureStatusMessage = "Saving to gallery..."
                             val saveResult = GalleryImageSaver.saveToGallery(context, jpegBytes)
 
-                            // 5. Update user status message
+                            // 7. Update user status message
                             captureStatusMessage = when (saveResult) {
                                 is GallerySaveResult.Success -> "Saved to gallery"
                                 is GallerySaveResult.Failure -> "Save failed: ${saveResult.userReason}"
@@ -373,19 +386,19 @@ private fun ActivePreviewContent(
                             captureStatusMessage = "Capture failed: system error"
                         } finally {
                             isCapturing = false
-                            // 4. Guaranteed preview rebound by incrementing reactive key
+                            // 8. Guaranteed preview rebound by incrementing reactive key
                             previewTrigger++
                         }
                     }
                 },
-                enabled = !isCapturing && cameraProvider != null
+                enabled = !isCapturing && cameraProvider != null && capabilityState != null
             ) {
                 if (isCapturing) {
                     CircularProgressIndicator(
                         color = Color.White,
                         modifier = Modifier.height(18.dp)
                     )
-                } else if (cameraProvider == null) {
+                } else if (cameraProvider == null || capabilityState == null) {
                     Text("WAITING")
                 } else {
                     Text("SHUTTER")

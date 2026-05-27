@@ -84,6 +84,20 @@ enhancements with the ProShot Natural color profile.
 > thousands of Kelvin, or product-relative slider units **must be resolved
 > before the color-science shader implementation consumes them**.
 
+> **v0 Processing Hook Implementation:**
+> In version 0, a pure Kotlin CPU-based processing hook (`LookProfileNv21Processor`) bridges the capture
+> and gallery output by applying the global tone curve and global saturation scale to the NV21 buffer
+> before JPEG compression. Both luma (tone curve) and chroma (saturation) transforms are precomputed as
+> 256-element byte look-up tables (LUTs) per frame, eliminating per-pixel floating-point math and reducing
+> the inner loops to simple array index operations. This enables fast, deterministic correctness testing
+> on JVM and Android before native shader/GPU compute blocks are fully wired.
+
+> **Output privacy note:** Normal saves go through Android MediaStore so photos
+> appear in the user's gallery. After a photo is saved there, access is governed
+> by Android, gallery apps, user-granted permissions, device security, and any
+> user-enabled cloud backup. ProShot should remain local-first and
+> permission-minimal by default.
+
 ## Data Types
 
 ```kotlin
