@@ -34,6 +34,7 @@ private const val TAG = "SingleFrameCaptureController"
 private const val CAPTURE_TIMEOUT_MS = 8_000L
 private const val AE_WARMUP_MIN_FRAMES = 3
 private const val AE_WARMUP_MAX_FRAMES = 12
+private const val AF_TRIGGER_MIN_FRAMES = 2
 private const val AF_LOCK_MAX_FRAMES = 12
 
 /**
@@ -109,7 +110,10 @@ object SingleFrameCaptureController {
      * devices where no autofocus trigger is useful.
      */
     fun selectAutoFocusModeForStillCapture(availableModes: IntArray?): Int? {
-        val modes = availableModes?.toSet().orEmpty()
+        if (availableModes == null) {
+            return null
+        }
+        val modes = availableModes.toSet()
         return when {
             CaptureRequest.CONTROL_AF_MODE_AUTO in modes -> CaptureRequest.CONTROL_AF_MODE_AUTO
             CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
@@ -121,16 +125,27 @@ object SingleFrameCaptureController {
     /**
      * Returns true when an AF state is safe to leave the autofocus wait loop.
      *
-     * Null is treated as ready because some devices do not report AF state for every
-     * result. Active scanning states are not ready because capturing during them can
-     * preserve the preview/final-frame focus mismatch seen in close-object smoke tests.
+     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` and `NOT_FOCUSED_LOCKED` are
+     * valid terminal states after an explicit `AF_TRIGGER_START`. `PASSIVE_FOCUSED` and
+     * `PASSIVE_UNFOCUSED` are pre-trigger residual states from the warm-up phase and
+     * must not be accepted, or the lock phase exits before the trigger takes effect.
+     *
+     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE` fallback, `PASSIVE_FOCUSED` and
+     * `PASSIVE_UNFOCUSED` are valid because passive AF converges without an explicit
+     * trigger.
+     *
+     * A null AF state is treated as ready because LEGACY hardware level cameras do not
+     * report AF state. On non-LEGACY cameras a null state may also appear briefly before
+     * the AF state machine initializes; the [AF_LOCK_MAX_FRAMES] cap prevents infinite
+     * wait in either case.
      */
-    fun isAutoFocusReadyForStillCapture(afState: Int?): Boolean {
+    fun isAutoFocusReadyForStillCapture(afState: Int?, afMode: Int): Boolean {
         return afState == null ||
             afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
             afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
-            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
-            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED
+            (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
+                (afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED))
     }
 
     /**
@@ -187,7 +202,7 @@ object SingleFrameCaptureController {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
 
-        // Match the closest supported size to 1080p for stability in T03
+        // Match the closest supported size to 1080p for single-frame stability.
         val mappedSizes = yuvSizes.map { CaptureSize(it.width, it.height) }
         val matchedSize = findClosestStableSize(mappedSizes)
         val targetSize = Size(matchedSize.width, matchedSize.height)
@@ -312,7 +327,8 @@ object SingleFrameCaptureController {
                 device = device,
                 session = session,
                 reader = reader,
-                handler = handler
+                handler = handler,
+                autoFocusMode = autoFocusMode
             )
 
             lockAutoFocusBeforeCapture(
@@ -403,7 +419,8 @@ object SingleFrameCaptureController {
         device: CameraDevice,
         session: CameraCaptureSession,
         reader: ImageReader,
-        handler: Handler
+        handler: Handler,
+        autoFocusMode: Int?
     ) {
         suspendCancellableCoroutine<Unit> { cont ->
             val isWarmupDone = AtomicBoolean(false)
@@ -434,7 +451,7 @@ object SingleFrameCaptureController {
 
             val warmupRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(reader.surface)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                autoFocusMode?.let { set(CaptureRequest.CONTROL_AF_MODE, it) }
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             }
 
@@ -537,8 +554,14 @@ object SingleFrameCaptureController {
                     result: android.hardware.camera2.TotalCaptureResult
                 ) {
                     frameCount++
+                    // Wait for at least AF_TRIGGER_MIN_FRAMES results before
+                    // evaluating AF state. This gives the HAL time to process
+                    // the latest repeating request and, in AUTO mode, the
+                    // queued AF trigger. Without this gate, the first callback
+                    // can report stale PASSIVE_FOCUSED and preserve old focus.
+                    if (frameCount < AF_TRIGGER_MIN_FRAMES) return
                     val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-                    if (isAutoFocusReadyForStillCapture(afState) || frameCount >= AF_LOCK_MAX_FRAMES) {
+                    if (isAutoFocusReadyForStillCapture(afState, autoFocusMode!!) || frameCount >= AF_LOCK_MAX_FRAMES) {
                         Log.d(TAG, "AF wait finished after $frameCount frames with state=$afState")
                         finishFocusWait()
                     }
@@ -565,13 +588,19 @@ object SingleFrameCaptureController {
                 }
                 session.setRepeatingRequest(repeatingRequest.build(), callback, handler)
 
-                val triggerRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(reader.surface)
-                    set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                // Only send AF_TRIGGER_START for AUTO mode. In CONTINUOUS_PICTURE
+                // mode, passive AF converges without an explicit trigger; sending
+                // TRIGGER_START in CONTINUOUS_PICTURE can produce incorrect lock
+                // behavior on some Qualcomm HALs.
+                if (autoFocusMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
+                    val triggerRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(reader.surface)
+                        set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
+                        set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    }
+                    session.capture(triggerRequest.build(), callback, handler)
                 }
-                session.capture(triggerRequest.build(), callback, handler)
             } catch (e: Exception) {
                 reader.setOnImageAvailableListener(null, null)
                 if (cont.isActive) {

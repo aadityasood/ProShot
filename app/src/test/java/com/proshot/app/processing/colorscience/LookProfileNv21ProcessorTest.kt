@@ -171,7 +171,7 @@ class LookProfileNv21ProcessorTest {
         assertEquals(0.toByte(), result.data[frameSize + 1])
     }
 
-    // ===== New tests added during T05 synthesis =====
+    // Additional validation tests.
 
     /**
      * Integration test: verifies the shipped [LookProfileCatalog.ProShotNatural]

@@ -234,45 +234,117 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun isAutoFocusReadyForStillCapture_acceptsOnlyTerminalOrUnknownStates() {
-        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null))
+    fun selectAutoFocusModeForStillCapture_returnsNullForNullCharacteristic() {
+        val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(null)
+
+        assertEquals(null, selected)
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_inAutoMode_acceptsOnlyLockedOrNullStates() {
+        val autoMode = CaptureRequest.CONTROL_AF_MODE_AUTO
+
+        // Null AF state is ready (LEGACY devices / uninitialized state)
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, autoMode))
+
+        // Locked states are ready (post-trigger terminal states)
         assertTrue(
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+                CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED, autoMode
             )
         )
         assertTrue(
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
-            )
-        )
-        assertTrue(
-            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
-            )
-        )
-        assertTrue(
-            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED
+                CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED, autoMode
             )
         )
 
+        // Passive states must NOT be accepted in AUTO mode; they are pre-trigger
+        // residual states from the warm-up phase
         assertTrue(
-            "Inactive AF must not be treated as ready for close-object still capture",
+            "PASSIVE_FOCUSED must not be accepted in AUTO mode",
             !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_INACTIVE
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED, autoMode
             )
         )
         assertTrue(
-            "Active AF scan must not be treated as ready for still capture",
+            "PASSIVE_UNFOCUSED must not be accepted in AUTO mode",
             !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED, autoMode
+            )
+        )
+
+        // Scanning states must not be accepted
+        assertTrue(
+            "Inactive AF must not be treated as ready",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_INACTIVE, autoMode
             )
         )
         assertTrue(
-            "Passive AF scan must not be treated as ready for still capture",
+            "Active AF scan must not be treated as ready",
             !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
-                CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN
+                CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN, autoMode
+            )
+        )
+        assertTrue(
+            "Passive AF scan must not be treated as ready",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN, autoMode
+            )
+        )
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_inContinuousPictureMode_acceptsPassiveStates() {
+        val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+
+        // Null AF state is ready
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, continuousMode))
+
+        // Locked states are ready
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED, continuousMode
+            )
+        )
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED, continuousMode
+            )
+        )
+
+        // Passive settled states ARE accepted in CONTINUOUS_PICTURE mode
+        assertTrue(
+            "PASSIVE_FOCUSED must be accepted in CONTINUOUS_PICTURE mode",
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED, continuousMode
+            )
+        )
+        assertTrue(
+            "PASSIVE_UNFOCUSED must be accepted in CONTINUOUS_PICTURE mode",
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED, continuousMode
+            )
+        )
+
+        // Scanning states must not be accepted even in CONTINUOUS_PICTURE mode
+        assertTrue(
+            "Inactive AF must not be treated as ready",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_INACTIVE, continuousMode
+            )
+        )
+        assertTrue(
+            "Active AF scan must not be treated as ready",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN, continuousMode
+            )
+        )
+        assertTrue(
+            "Passive AF scan must not be treated as ready",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN, continuousMode
             )
         )
     }
