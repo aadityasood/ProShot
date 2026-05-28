@@ -1,5 +1,7 @@
 package com.proshot.app.camera
 
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -195,5 +197,83 @@ class CopiedImageFrameTest {
         assertTrue(formatted.contains("Y: 100"))
         assertTrue(formatted.contains("U: 50"))
         assertTrue(formatted.contains("V: 50"))
+    }
+
+    @Test
+    fun selectAutoFocusModeForStillCapture_prefersAutoForTriggerLock() {
+        val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
+            intArrayOf(
+                CaptureRequest.CONTROL_AF_MODE_OFF,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+                CaptureRequest.CONTROL_AF_MODE_AUTO
+            )
+        )
+
+        assertEquals(CaptureRequest.CONTROL_AF_MODE_AUTO, selected)
+    }
+
+    @Test
+    fun selectAutoFocusModeForStillCapture_fallsBackToContinuousPictureWhenAutoUnavailable() {
+        val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
+            intArrayOf(
+                CaptureRequest.CONTROL_AF_MODE_OFF,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+        )
+
+        assertEquals(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, selected)
+    }
+
+    @Test
+    fun selectAutoFocusModeForStillCapture_returnsNullForFixedFocusOnlyCamera() {
+        val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
+            intArrayOf(CaptureRequest.CONTROL_AF_MODE_OFF)
+        )
+
+        assertEquals(null, selected)
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_acceptsOnlyTerminalOrUnknownStates() {
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null))
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+            )
+        )
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+            )
+        )
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+            )
+        )
+        assertTrue(
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED
+            )
+        )
+
+        assertTrue(
+            "Inactive AF must not be treated as ready for close-object still capture",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_INACTIVE
+            )
+        )
+        assertTrue(
+            "Active AF scan must not be treated as ready for still capture",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+            )
+        )
+        assertTrue(
+            "Passive AF scan must not be treated as ready for still capture",
+            !SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN
+            )
+        )
     }
 }
