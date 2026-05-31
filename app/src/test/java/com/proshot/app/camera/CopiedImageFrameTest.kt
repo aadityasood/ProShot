@@ -4,6 +4,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
@@ -241,19 +242,23 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun isAutoFocusReadyForStillCapture_inAutoMode_acceptsOnlyLockedOrNullStates() {
+    fun isAutoFocusReadyForStillCapture_inAutoMode_acceptsOnlyFocusedOrNullStates() {
         val autoMode = CaptureRequest.CONTROL_AF_MODE_AUTO
 
         // Null AF state is ready (LEGACY devices / uninitialized state)
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, autoMode))
 
-        // Locked states are ready (post-trigger terminal states)
+        // Focused locked is ready (post-trigger focused terminal state)
         assertTrue(
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED, autoMode
             )
         )
-        assertTrue(
+
+        // Not-focused locked means the device finished scanning but did not focus;
+        // keep waiting until the frame cap instead of capturing a soft close subject.
+        assertFalse(
+            "NOT_FOCUSED_LOCKED must not be accepted in AUTO mode",
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED, autoMode
             )
@@ -296,33 +301,38 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun isAutoFocusReadyForStillCapture_inContinuousPictureMode_acceptsPassiveStates() {
+    fun isAutoFocusReadyForStillCapture_inContinuousPictureMode_acceptsFocusedStatesOnly() {
         val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
 
         // Null AF state is ready
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, continuousMode))
 
-        // Locked states are ready
+        // Focused locked is ready
         assertTrue(
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED, continuousMode
             )
         )
-        assertTrue(
+
+        // Not-focused locked is a terminal focus failure, not a good capture state.
+        assertFalse(
+            "NOT_FOCUSED_LOCKED must not be accepted in CONTINUOUS_PICTURE mode",
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED, continuousMode
             )
         )
 
-        // Passive settled states ARE accepted in CONTINUOUS_PICTURE mode
+        // Passive focused is accepted in CONTINUOUS_PICTURE mode
         assertTrue(
             "PASSIVE_FOCUSED must be accepted in CONTINUOUS_PICTURE mode",
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED, continuousMode
             )
         )
-        assertTrue(
-            "PASSIVE_UNFOCUSED must be accepted in CONTINUOUS_PICTURE mode",
+
+        // Passive unfocused means continuous AF is settled but not sharp yet.
+        assertFalse(
+            "PASSIVE_UNFOCUSED must not be accepted in CONTINUOUS_PICTURE mode",
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
                 CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED, continuousMode
             )

@@ -35,7 +35,7 @@ private const val CAPTURE_TIMEOUT_MS = 8_000L
 private const val AE_WARMUP_MIN_FRAMES = 3
 private const val AE_WARMUP_MAX_FRAMES = 12
 private const val AF_TRIGGER_MIN_FRAMES = 2
-private const val AF_LOCK_MAX_FRAMES = 12
+private const val AF_LOCK_MAX_FRAMES = 30
 
 /**
  * Represent standard image dimension in a pure Kotlin format to enable robust
@@ -125,14 +125,16 @@ object SingleFrameCaptureController {
     /**
      * Returns true when an AF state is safe to leave the autofocus wait loop.
      *
-     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` and `NOT_FOCUSED_LOCKED` are
-     * valid terminal states after an explicit `AF_TRIGGER_START`. `PASSIVE_FOCUSED` and
-     * `PASSIVE_UNFOCUSED` are pre-trigger residual states from the warm-up phase and
-     * must not be accepted, or the lock phase exits before the trigger takes effect.
+     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` is accepted after an explicit
+     * `AF_TRIGGER_START`. `NOT_FOCUSED_LOCKED` means the HAL finished scanning without
+     * focus, so the controller keeps waiting until the frame cap instead of immediately
+     * saving a soft close-subject photo. `PASSIVE_FOCUSED` and `PASSIVE_UNFOCUSED` are
+     * pre-trigger residual states from the warm-up phase and must not be accepted, or
+     * the lock phase exits before the trigger takes effect.
      *
-     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE` fallback, `PASSIVE_FOCUSED` and
-     * `PASSIVE_UNFOCUSED` are valid because passive AF converges without an explicit
-     * trigger.
+     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE` fallback, `PASSIVE_FOCUSED` is valid
+     * because passive AF converges without an explicit trigger. `PASSIVE_UNFOCUSED`
+     * keeps waiting until the frame cap for the same close-subject reason.
      *
      * A null AF state is treated as ready because LEGACY hardware level cameras do not
      * report AF state. On non-LEGACY cameras a null state may also appear briefly before
@@ -142,10 +144,8 @@ object SingleFrameCaptureController {
     fun isAutoFocusReadyForStillCapture(afState: Int?, afMode: Int): Boolean {
         return afState == null ||
             afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-            afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
             (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
-                (afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
-                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED))
+                afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED)
     }
 
     /**
