@@ -38,7 +38,7 @@ find_library( # Sets the name of the path variable.
               # you want CMake to locate.
               log )
 
-# TODO: OpenCV integration steps (for T03/T04):
+# TODO: OpenCV integration steps for future native processing:
 #   1. Download OpenCV Android SDK 4.9.x
 #   2. Set OpenCV_DIR via cmake arguments in build.gradle.kts:
 #      arguments("-DOpenCV_DIR=/path/to/OpenCV-android-sdk/sdk/native/jni")

@@ -24,7 +24,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         /**
          * Whether the native library loaded successfully. `false` when the NDK
-         * pipeline has not been built yet (T01-D003).
+         * pipeline has not been built yet.
          */
         @JvmStatic
         val nativeLibraryAvailable: Boolean

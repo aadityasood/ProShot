@@ -8,7 +8,7 @@
     <!-- API 26-28: legacy external storage write access. Dropped on API 29+ (scoped storage). -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <!-- READ_EXTERNAL_STORAGE and READ_MEDIA_IMAGES are intentionally omitted:
-         T04 saves app-owned photos via MediaStore.insert which does not require read access.
+         App-owned photo saves use MediaStore.insert and do not require read access.
          Add them back only when a gallery browsing or image picker feature is introduced. -->
 
     <application

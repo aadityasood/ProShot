@@ -61,13 +61,28 @@ object GalleryImageSaver {
     private const val ALBUM_PATH = "Pictures/ProShot"
 
     /**
-     * Generates a stable, standard filename based on current timestamp.
+     * Generates a stable, standard filename based on current timestamp and an optional suffix.
+     *
+     * @param timestampMs The epoch timestamp in milliseconds.
+     * @param suffix An optional suffix to append to the filename (e.g., "baseline" or "natural").
+     * @throws IllegalArgumentException If suffix is non-null but blank or contains unsafe characters.
      */
-    fun generateFilename(timestampMs: Long): String {
-        val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
+    fun generateFilename(timestampMs: Long, suffix: String? = null): String {
+        if (suffix != null) {
+            require(suffix.isNotBlank()) { "Filename suffix must not be blank." }
+            require(suffix.all { it.isLetterOrDigit() || it == '_' || it == '-' }) {
+                "Filename suffix contains unsafe characters. Only letters, numbers, underscores, and hyphens are allowed."
+            }
         }
-        return "ProShot_${sdf.format(Date(timestampMs))}.jpg"
+        val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).apply {
+            timeZone = TimeZone.getDefault()
+        }
+        val base = "ProShot_${sdf.format(Date(timestampMs))}"
+        return if (suffix != null) {
+            "${base}_$suffix.jpg"
+        } else {
+            "$base.jpg"
+        }
     }
 
     /**
@@ -76,12 +91,14 @@ object GalleryImageSaver {
      * @param context The application or activity context.
      * @param jpegBytes The raw encoded JPEG image data.
      * @param timestampMs The epoch timestamp in milliseconds when the image was captured.
+     * @param filenameSuffix An optional suffix to append to the generated filename.
      * @return [GallerySaveResult] indicating the success details or friendly failure reason.
      */
     suspend fun saveToGallery(
         context: Context,
         jpegBytes: ByteArray,
-        timestampMs: Long = System.currentTimeMillis()
+        timestampMs: Long = System.currentTimeMillis(),
+        filenameSuffix: String? = null
     ): GallerySaveResult = withContext(Dispatchers.IO) {
         if (jpegBytes.isEmpty()) {
             Log.w(TAG, "Refusing to save empty JPEG data")
@@ -106,7 +123,7 @@ object GalleryImageSaver {
         }
 
         val resolver = context.contentResolver
-        val filename = generateFilename(timestampMs)
+        val filename = generateFilename(timestampMs, filenameSuffix)
 
         // 2. Prepare explicit MediaStore metadata
         val contentValues = ContentValues().apply {
@@ -134,7 +151,7 @@ object GalleryImageSaver {
 
             // 4. Stream raw JPEG bytes to the reserved location
             val outputStream: OutputStream = resolver.openOutputStream(itemUri)
-                ?: throw IOException("Failed to open output stream for Uri: $itemUri")
+                ?: throw IOException("Failed to open output stream for MediaStore entry")
 
             outputStream.use { stream ->
                 stream.write(jpegBytes)
@@ -147,7 +164,7 @@ object GalleryImageSaver {
                 contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
                 val rowsUpdated = resolver.update(itemUri, contentValues, null, null)
                 if (rowsUpdated == 0) {
-                    Log.e(TAG, "IS_PENDING clear failed (update returned 0) for $itemUri")
+                    Log.e(TAG, "IS_PENDING clear failed (update returned 0) for saved image")
                     cleanupOrphanRow(context, itemUri)
                     return@withContext GallerySaveResult.Failure(
                         userReason = "Photo was saved but could not be published to the gallery"
@@ -158,7 +175,7 @@ object GalleryImageSaver {
                 null
             }
 
-            Log.d(TAG, "Successfully saved image to system gallery: $itemUri")
+            Log.d(TAG, "Successfully saved image to system gallery: $filename")
             GallerySaveResult.Success(
                 uri = itemUri,
                 displayName = filename,
@@ -196,9 +213,9 @@ object GalleryImageSaver {
         if (uri == null) return
         try {
             context.contentResolver.delete(uri, null, null)
-            Log.d(TAG, "Successfully cleaned up partial/orphan MediaStore row: $uri")
+            Log.d(TAG, "Successfully cleaned up partial/orphan MediaStore row")
         } catch (delEx: Exception) {
-            Log.w(TAG, "Failed to clean up orphan MediaStore row: $uri", delEx)
+            Log.w(TAG, "Failed to clean up orphan MediaStore row", delEx)
         }
     }
 }
