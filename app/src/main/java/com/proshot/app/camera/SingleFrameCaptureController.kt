@@ -137,9 +137,15 @@ object SingleFrameCaptureController {
      * keeps waiting until the frame cap for the same close-subject reason.
      *
      * A null AF state is treated as ready because LEGACY hardware level cameras do not
-     * report AF state. On non-LEGACY cameras a null state may also appear briefly before
-     * the AF state machine initializes; the [AF_LOCK_MAX_FRAMES] cap prevents infinite
-     * wait in either case.
+     * report AF state, and [lockAutoFocusBeforeCapture] is called whenever any triggerable
+     * AF mode is available, including on LEGACY devices that expose `AUTO` or
+     * `CONTINUOUS_PICTURE` without supporting the full AF state machine. On non-LEGACY
+     * cameras a null state may also appear briefly before the AF state machine initializes;
+     * the [AF_TRIGGER_MIN_FRAMES] gate filters these transient nulls, and the
+     * [AF_LOCK_MAX_FRAMES] cap prevents infinite wait in either case.
+     *
+     * The log in [lockAutoFocusBeforeCapture] distinguishes a null-state exit from a
+     * focused-lock exit for diagnostic visibility.
      */
     fun isAutoFocusReadyForStillCapture(afState: Int?, afMode: Int): Boolean {
         return afState == null ||
@@ -196,9 +202,11 @@ object SingleFrameCaptureController {
         val cameraId = resolvePrimaryCameraId(manager)
 
         val characteristics = manager.getCameraCharacteristics(cameraId)
-        val autoFocusMode = selectAutoFocusModeForStillCapture(
-            characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-        )
+        val availableAutoFocusModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+        if (availableAutoFocusModes == null) {
+            Log.w(TAG, "CONTROL_AF_AVAILABLE_MODES characteristic is null; assuming fixed-focus")
+        }
+        val autoFocusMode = selectAutoFocusModeForStillCapture(availableAutoFocusModes)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
 
@@ -561,8 +569,12 @@ object SingleFrameCaptureController {
                     // can report stale PASSIVE_FOCUSED and preserve old focus.
                     if (frameCount < AF_TRIGGER_MIN_FRAMES) return
                     val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-                    if (isAutoFocusReadyForStillCapture(afState, autoFocusMode!!) || frameCount >= AF_LOCK_MAX_FRAMES) {
-                        Log.d(TAG, "AF wait finished after $frameCount frames with state=$afState")
+                    if (isAutoFocusReadyForStillCapture(afState, autoFocusMode!!)) {
+                        val reason = if (afState == null) "null AF state (LEGACY/uninitialized)" else "AF state=$afState"
+                        Log.d(TAG, "AF wait finished after $frameCount frames: focused ($reason)")
+                        finishFocusWait()
+                    } else if (frameCount >= AF_LOCK_MAX_FRAMES) {
+                        Log.w(TAG, "AF wait hit frame cap after $frameCount frames with state=$afState (focus may not have converged)")
                         finishFocusWait()
                     }
                 }
