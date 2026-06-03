@@ -48,14 +48,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.proshot.app.camera.CameraCapabilitiesMapper
+import com.proshot.app.camera.CaptureCoordinator
+import com.proshot.app.camera.CaptureResult
 import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
 import com.proshot.app.camera.compat.DeviceCameraCapabilities
-import com.proshot.app.output.CapturedImageEncoder
-import com.proshot.app.output.GalleryImageSaver
-import com.proshot.app.output.GallerySaveResult
-import com.proshot.app.processing.colorscience.LookProfileNv21Processor
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -332,112 +330,26 @@ private fun ActivePreviewContent(
                                 cameraProvider?.unbindAll()
                             }
 
-                            // 2. Call Camera2 raw capture on background dispatcher
-                            val frame = withContext(Dispatchers.Default) {
-                                SingleFrameCaptureController.captureSingleFrame(context)
-                            }
-                            val outputRotationDegrees = withContext(Dispatchers.IO) {
-                                SingleFrameCaptureController.resolveOutputRotationDegrees(context)
-                            }
-
-                            val captureTimestampMs = System.currentTimeMillis()
-
-                            // 3. Encode captured frame to NV21 & orient it on Dispatchers.Default
-                            captureStatusMessage = "Encoding captured frame..."
-                            val orientedNv21 = withContext(Dispatchers.Default) {
-                                val nv21 = CapturedImageEncoder.yuv420ToNv21(frame)
-                                CapturedImageEncoder.rotateNv21(
-                                    nv21 = nv21,
-                                    width = frame.width,
-                                    height = frame.height,
-                                    rotationDegrees = outputRotationDegrees
-                                )
-                            }
-
-                            var baselineSaveResult: GallerySaveResult? = null
-                            if (isDebugBuild) {
-                                // Compress oriented baseline NV21 on Dispatchers.Default
-                                val baselineJpegBytes = withContext(Dispatchers.Default) {
-                                    CapturedImageEncoder.compressNv21ToJpeg(
-                                        nv21 = orientedNv21.data,
-                                        width = orientedNv21.width,
-                                        height = orientedNv21.height
-                                    )
-                                }
-                                // Save with suffix "baseline" on Dispatchers.IO
-                                captureStatusMessage = "Saving baseline photo..."
-                                baselineSaveResult = GalleryImageSaver.saveToGallery(
-                                    context = context,
-                                    jpegBytes = baselineJpegBytes,
-                                    timestampMs = captureTimestampMs,
-                                    filenameSuffix = "baseline"
-                                )
-                            }
-
-                            // 4. Apply ProShot Natural v0 processing hook on Dispatchers.Default
-                            captureStatusMessage = "Processing photo..."
-                            val processedNv21 = withContext(Dispatchers.Default) {
-                                LookProfileNv21Processor.apply(orientedNv21, lookProfile)
-                            }
-
-                            // 5. Compress processed NV21 to JPEG on Dispatchers.Default
-                            val jpegBytes = withContext(Dispatchers.Default) {
-                                CapturedImageEncoder.compressNv21ToJpeg(
-                                    nv21 = processedNv21.data,
-                                    width = processedNv21.width,
-                                    height = processedNv21.height
-                                )
-                            }
-
-                            // 6. Save JPEG to gallery on Dispatchers.IO
-                            captureStatusMessage = "Saving to gallery..."
-                            val saveResult = GalleryImageSaver.saveToGallery(
+                            // 2. Delegate capture orchestration and background dispatch to CaptureCoordinator
+                            val result = CaptureCoordinator.executeCapture(
                                 context = context,
-                                jpegBytes = jpegBytes,
-                                timestampMs = captureTimestampMs,
-                                filenameSuffix = if (isDebugBuild) "natural" else null
-                            )
+                                lookProfile = lookProfile,
+                                isDebug = isDebugBuild
+                            ) { status ->
+                                captureStatusMessage = status
+                            }
 
-                            // 7. Update user status message
-                            captureStatusMessage = if (isDebugBuild) {
-                                when (saveResult) {
-                                    is GallerySaveResult.Success -> {
-                                        if (baselineSaveResult is GallerySaveResult.Success) {
-                                            "Saved diagnostic pair"
-                                        } else {
-                                            val reason = (baselineSaveResult as? GallerySaveResult.Failure)?.userReason ?: "unknown error"
-                                            "Saved natural; baseline failed: $reason"
-                                        }
-                                    }
-                                    is GallerySaveResult.Failure -> {
-                                        if (baselineSaveResult is GallerySaveResult.Success) {
-                                            "Saved baseline; natural failed: ${saveResult.userReason}"
-                                        } else {
-                                            "Save failed: ${saveResult.userReason}"
-                                        }
-                                    }
-                                }
-                            } else {
-                                when (saveResult) {
-                                    is GallerySaveResult.Success -> "Saved to gallery"
-                                    is GallerySaveResult.Failure -> "Save failed: ${saveResult.userReason}"
-                                }
+                            // 3. Map high-level result to the UI status message
+                            captureStatusMessage = when (result) {
+                                is CaptureResult.Success -> result.message
+                                is CaptureResult.Failure -> result.message
                             }
                         } catch (e: CancellationException) {
                             captureStatusMessage = "Capture cancelled."
                             throw e
-                        } catch (e: IllegalArgumentException) {
-                            Log.e(TAG, "Frame verification failed", e)
-                            captureStatusMessage = "Capture failed: invalid image data"
-                        } catch (e: OutOfMemoryError) {
-                            Log.e(TAG, "OOM during capture/encode; frame too large for available memory", e)
-                            captureStatusMessage = "Not enough memory to save photo"
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Single frame capture or encode failed", e)
-                            captureStatusMessage = "Capture failed: system error"
                         } finally {
                             isCapturing = false
-                            // 8. Guaranteed preview rebound by incrementing reactive key
+                            // 4. Guaranteed preview rebound by incrementing reactive key
                             previewTrigger++
                         }
                     }

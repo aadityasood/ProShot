@@ -98,6 +98,12 @@ enhancements with the ProShot Natural color profile.
 > user-enabled cloud backup. ProShot should remain local-first and
 > permission-minimal by default.
 
+> **Capture Orchestration Coordinator:**
+> The physical capture orchestration is decoupled from Compose UI state through `CaptureCoordinator`. The
+> coordinator manages physical camera burst capture (single frame YUV for v0), orientation adjustments,
+> look profile color science mapping, and gallery output saving, running stages on appropriate background
+> thread dispatchers (`Dispatchers.Default` for pixel work and `Dispatchers.IO` for MediaStore interactions).
+
 ## Data Types
 
 ```kotlin
