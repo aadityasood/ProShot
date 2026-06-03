@@ -19,6 +19,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -38,7 +39,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -60,10 +74,29 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val TAG = "CameraScreen"
+
+/**
+ * Maps coordinator progress strings to beginner-safe UI vocabulary.
+ *
+ * The [CaptureCoordinator] emits pipeline-specific status strings (e.g. "Encoding
+ * captured frame...") that are useful for diagnostics but too technical for the main
+ * status pill. This function translates them to simple camera-app language.
+ */
+private fun mapStatusForDisplay(coordinatorStatus: String): String {
+    return when (coordinatorStatus) {
+        "Initiating capture..." -> "Taking photo..."
+        "Encoding captured frame..." -> "Taking photo..."
+        "Saving baseline photo..." -> "Saving photo..."
+        "Processing photo..." -> "Processing photo..."
+        "Saving to gallery..." -> "Saving photo..."
+        else -> "Working..."
+    }
+}
 
 /**
  * States for the camera permissions and preview workflow state machine.
@@ -203,7 +236,8 @@ private fun ActivePreviewContent(
 
     var previewTrigger by remember { mutableIntStateOf(0) }
     var isCapturing by remember { mutableStateOf(false) }
-    var captureStatusMessage by remember { mutableStateOf("Idle - Tap Shutter to capture YUV") }
+    var captureStatusMessage by remember { mutableStateOf("") }
+    var showDebugOverlay by remember { mutableStateOf(false) }
     val isDebugBuild = remember(context) {
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     }
@@ -250,7 +284,7 @@ private fun ActivePreviewContent(
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind CameraX preview", e)
-            onCameraError(e.localizedMessage ?: "Unknown CameraX bind error")
+            onCameraError("Camera could not start. Please try again.")
         }
     }
 
@@ -286,43 +320,92 @@ private fun ActivePreviewContent(
             modifier = Modifier.fillMaxSize()
         )
 
-        // TODO(REMOVE BEFORE RELEASE): Debug-only status overlay.
-        // This overlay is a temporary diagnostic aid for development and device testing.
-        // It must be removed or gated behind a debug build flag before any external release.
-        capabilityState?.let { (capabilities, decision) ->
-            DebugStatusOverlay(capabilities, decision)
+        // Debug controls (only available in debug builds)
+        if (isDebugBuild) {
+            // Tiny toggle chip in TopEnd
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 48.dp, end = 16.dp)
+                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), shape = RoundedCornerShape(16.dp))
+                    .clickable { showDebugOverlay = !showDebugOverlay }
+                    .semantics {
+                        role = Role.Button
+                        contentDescription = if (showDebugOverlay) {
+                            "Hide debug diagnostics"
+                        } else {
+                            "Show debug diagnostics"
+                        }
+                        stateDescription = if (showDebugOverlay) "Expanded" else "Collapsed"
+                    }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (showDebugOverlay) "Hide" else "Debug",
+                    color = Color.Green,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            // Debug overlay in TopStart (only if expanded)
+            if (showDebugOverlay && capabilityState != null) {
+                val (capabilities, decision) = capabilityState!!
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(top = 48.dp, start = 16.dp)
+                ) {
+                    DebugStatusOverlay(capabilities, decision)
+                }
+            }
         }
 
-        // Minimal capture state and shutter UI
+        // Shutter and feedback container
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(16.dp)
-                .background(Color.Black.copy(alpha = 0.7f))
-                .padding(16.dp),
+                .padding(bottom = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = "State: ${if (isCapturing) "Capturing" else "Idle"}",
-                color = if (isCapturing) Color.Yellow else Color.Green,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = captureStatusMessage,
-                color = Color.White,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(16.dp))
-            Button(
+            // Auto-clear terminal status messages after 3 seconds to unclutter the viewfinder.
+            if (captureStatusMessage.isNotEmpty() && !isCapturing) {
+                LaunchedEffect(captureStatusMessage) {
+                    delay(3000L)
+                    captureStatusMessage = ""
+                }
+            }
+
+            // Styled status message pill
+            if (captureStatusMessage.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.7f), shape = RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = captureStatusMessage,
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+
+            ShutterButton(
+                enabled = !isCapturing && cameraProvider != null && capabilityState != null,
+                isCapturing = isCapturing,
+                isWaiting = cameraProvider == null || capabilityState == null,
                 onClick = {
-                    if (isCapturing) return@Button
-                    val activeDecision = capabilityState?.second ?: return@Button
+                    val activeDecision = capabilityState?.second ?: return@ShutterButton
                     val lookProfile = activeDecision.lookProfile
                     isCapturing = true
-                    captureStatusMessage = "Initiating capture..."
+                    captureStatusMessage = "Taking photo..."
                     scope.launch {
                         try {
                             // 1. Explicitly unbind all CameraX use cases from the provider on Main thread
@@ -336,7 +419,8 @@ private fun ActivePreviewContent(
                                 lookProfile = lookProfile,
                                 isDebug = isDebugBuild
                             ) { status ->
-                                captureStatusMessage = status
+                                // Map coordinator progress to beginner-safe vocabulary.
+                                captureStatusMessage = mapStatusForDisplay(status)
                             }
 
                             // 3. Map high-level result to the UI status message
@@ -353,20 +437,81 @@ private fun ActivePreviewContent(
                             previewTrigger++
                         }
                     }
-                },
-                enabled = !isCapturing && cameraProvider != null && capabilityState != null
-            ) {
-                if (isCapturing) {
-                    CircularProgressIndicator(
-                        color = Color.White,
-                        modifier = Modifier.height(18.dp)
-                    )
-                } else if (cameraProvider == null || capabilityState == null) {
-                    Text("WAITING")
-                } else {
-                    Text("SHUTTER")
+                }
+            )
+        }
+    }
+}
+
+/**
+ * A camera-style circular shutter control.
+ * Displays a capturing state with shrinking circle size and an active progress indicator,
+ * and a disabled/waiting state.
+ */
+@Composable
+private fun ShutterButton(
+    enabled: Boolean,
+    isCapturing: Boolean,
+    isWaiting: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val innerSize by animateDpAsState(
+        targetValue = when {
+            isWaiting -> 0.dp
+            isCapturing -> 44.dp
+            else -> 60.dp
+        },
+        label = "shutterInnerSize"
+    )
+
+    Box(
+        modifier = modifier
+            .size(84.dp)
+            .semantics {
+                role = Role.Button
+                contentDescription = when {
+                    isWaiting -> "Camera loading"
+                    isCapturing -> "Capturing photo"
+                    else -> "Take photo"
+                }
+                stateDescription = when {
+                    isWaiting -> "Waiting"
+                    isCapturing -> "Capturing"
+                    enabled -> "Ready"
+                    else -> "Disabled"
                 }
             }
+            .clickable(
+                enabled = enabled && !isWaiting && !isCapturing,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        // Outer Ring
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawCircle(
+                color = Color.White.copy(alpha = if (isWaiting) 0.3f else 1.0f),
+                radius = (size.minDimension / 2) - 4.dp.toPx(),
+                style = Stroke(width = 4.dp.toPx())
+            )
+        }
+
+        if (isWaiting || isCapturing) {
+            CircularProgressIndicator(
+                color = Color.White,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(52.dp)
+            )
+        }
+
+        if (innerSize > 0.dp) {
+            Box(
+                modifier = Modifier
+                    .size(innerSize)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = if (enabled) 1.0f else 0.5f))
+            )
         }
     }
 }
@@ -381,9 +526,8 @@ private fun DebugStatusOverlay(
 ) {
     Column(
         modifier = Modifier
-            .padding(16.dp)
-            .background(Color.Black.copy(alpha = 0.6f))
-            .padding(8.dp)
+            .background(Color.Black.copy(alpha = 0.75f), shape = RoundedCornerShape(12.dp))
+            .padding(12.dp)
     ) {
         Text(
             text = "ProShot Debug Status",
