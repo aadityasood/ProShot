@@ -186,15 +186,22 @@ object SingleFrameCaptureController {
      * @throws SecurityException if [android.Manifest.permission.CAMERA] is not held by the caller.
      * @throws IllegalStateException if no camera is available or capture resources cannot be initialized.
      */
-    suspend fun captureSingleFrame(context: Context): CopiedImageFrame = withContext(Dispatchers.Default) {
+    suspend fun captureSingleFrame(
+        context: Context,
+        tracker: CaptureTimingTracker? = null
+    ): CopiedImageFrame = withContext(Dispatchers.Default) {
         withTimeout(CAPTURE_TIMEOUT_MS) {
-            captureSingleFrameOnCurrentThread(context)
+            captureSingleFrameOnCurrentThread(context, tracker)
         }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @SuppressLint("MissingPermission")
-    private suspend fun captureSingleFrameOnCurrentThread(context: Context): CopiedImageFrame {
+    private suspend fun captureSingleFrameOnCurrentThread(
+        context: Context,
+        tracker: CaptureTimingTracker? = null
+    ): CopiedImageFrame {
+        val totalStart = tracker?.let { System.nanoTime() }
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             ?: throw IllegalStateException("CameraManager is not available")
 
@@ -234,6 +241,7 @@ object SingleFrameCaptureController {
 
         return try {
             // 3. Open CameraDevice asynchronously
+            val openStart = tracker?.let { System.nanoTime() }
             cameraDevice = suspendCancellableCoroutine { cont ->
                 manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
@@ -274,6 +282,9 @@ object SingleFrameCaptureController {
                     // The finally block handles handlerThread.quitSafely().
                 }
             }
+            if (openStart != null) {
+                tracker?.cameraOpenMs = (System.nanoTime() - openStart) / 1_000_000L
+            }
 
             // 4. Initialize ImageReader
             imageReader = ImageReader.newInstance(targetSize.width, targetSize.height, ImageFormat.YUV_420_888, 4)
@@ -282,6 +293,7 @@ object SingleFrameCaptureController {
             // TODO: Migrate to createCaptureSession(SessionConfiguration) before
             // burst-capture task. The deprecated overload is still functional on minSdk 26.
             @Suppress("DEPRECATION")
+            val configStart = tracker?.let { System.nanoTime() }
             captureSession = suspendCancellableCoroutine { cont ->
                 val device = cameraDevice
                 if (device == null) {
@@ -321,6 +333,9 @@ object SingleFrameCaptureController {
                     pendingSession.get()?.close()
                 }
             }
+            if (configStart != null) {
+                tracker?.sessionConfigMs = (System.nanoTime() - configStart) / 1_000_000L
+            }
 
             // 6. Run a short YUV drain before still capture so Camera2 AE can settle.
             val reader = imageReader
@@ -331,6 +346,7 @@ object SingleFrameCaptureController {
                 throw IllegalStateException("Camera2 capture resources were not fully initialized")
             }
 
+            val warmupStart = tracker?.let { System.nanoTime() }
             warmUpAutoExposure(
                 device = device,
                 session = session,
@@ -338,7 +354,11 @@ object SingleFrameCaptureController {
                 handler = handler,
                 autoFocusMode = autoFocusMode
             )
+            if (warmupStart != null) {
+                tracker?.aeWarmupMs = (System.nanoTime() - warmupStart) / 1_000_000L
+            }
 
+            val afStart = tracker?.let { System.nanoTime() }
             lockAutoFocusBeforeCapture(
                 device = device,
                 session = session,
@@ -346,8 +366,12 @@ object SingleFrameCaptureController {
                 handler = handler,
                 autoFocusMode = autoFocusMode
             )
+            if (afStart != null) {
+                tracker?.afWaitMs = (System.nanoTime() - afStart) / 1_000_000L
+            }
 
-            suspendCancellableCoroutine<CopiedImageFrame> { cont ->
+            val stillStart = tracker?.let { System.nanoTime() }
+            val copiedFrame = suspendCancellableCoroutine<CopiedImageFrame> { cont ->
                 reader.setOnImageAvailableListener({ imageReaderRef ->
                     // image declared outside try so finally can always close it.
                     // acquireLatestImage is inside try to catch IllegalStateException
@@ -395,6 +419,14 @@ object SingleFrameCaptureController {
                     Log.d(TAG, "Single frame capture cancelled")
                 }
             }
+            if (stillStart != null) {
+                tracker?.stillCaptureMs = (System.nanoTime() - stillStart) / 1_000_000L
+            }
+            if (totalStart != null) {
+                tracker?.totalCamera2CaptureMs = (System.nanoTime() - totalStart) / 1_000_000L
+            }
+
+            copiedFrame
         } finally {
             // 7. Guaranteed resource cleanup on success, failure, and cancellation
             Log.d(TAG, "Aggressively closing physical and native capture resources")
