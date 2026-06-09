@@ -105,7 +105,10 @@ enhancements with the ProShot Natural color profile.
 > thread dispatchers (`Dispatchers.Default` for pixel work and `Dispatchers.IO` for MediaStore interactions).
 
 > **Capture Latency Diagnostics:**
-> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds.
+> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds. (Note: AE warm-up and AF wait latencies run concurrently in a combined pre-capture phase to minimize total capture latency).
+
+> **Pre-Capture AF Policy:**
+> `CapturePreCapturePolicy` is a deterministic, JVM-testable helper with no logging or runtime side effects. It determines AE/AF readiness during the combined pre-capture phase. Key rules: (1) null AF state is never accepted as ready in active AF modes (AUTO, CONTINUOUS_PICTURE) - this prevents premature exit on Qualcomm HALs where null appears during trigger processing; (2) `AF_TRIGGER_MIN_FRAMES=3` guards against pipeline-depth-3 devices delivering pre-trigger repeating results before the trigger frame; (3) `FOCUSED_LOCKED` is accepted as a terminal converged state in all AF modes; (4) LEGACY cameras without a real AF state machine safely fall through to the `MAX_PRE_CAPTURE_FRAMES=30` cap.
 
 ## Data Types
 

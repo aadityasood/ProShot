@@ -242,11 +242,12 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun isAutoFocusReadyForStillCapture_inAutoMode_acceptsOnlyFocusedOrNullStates() {
+    fun isAutoFocusReadyForStillCapture_inAutoMode_acceptsOnlyFocusedState() {
         val autoMode = CaptureRequest.CONTROL_AF_MODE_AUTO
 
-        // Null AF state is ready (LEGACY devices / uninitialized state)
-        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, autoMode))
+        // Null AF state is not ready in active AF modes; the frame cap handles
+        // LEGACY devices that never report AF state.
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, autoMode))
 
         // Focused locked is ready (post-trigger focused terminal state)
         assertTrue(
@@ -304,8 +305,9 @@ class CopiedImageFrameTest {
     fun isAutoFocusReadyForStillCapture_inContinuousPictureMode_acceptsFocusedStatesOnly() {
         val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
 
-        // Null AF state is ready
-        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, continuousMode))
+        // Null AF state is not ready in active AF modes; the frame cap handles
+        // LEGACY devices that never report AF state.
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(null, continuousMode))
 
         // Focused locked is ready
         assertTrue(
