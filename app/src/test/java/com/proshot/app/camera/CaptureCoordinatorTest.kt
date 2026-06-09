@@ -109,7 +109,7 @@ class CaptureCoordinatorTest {
     @Test
     fun mapOutcome_inDebugBuild_whenBaselineIsNull_returnsSuccessWithUnknownBaselineError() {
         val saveResult = SaveOutcome(isSuccess = true)
-        // baselineSaveOutcome is null — baseline was never attempted or failed before save
+        // baselineSaveOutcome is null: baseline was never attempted or failed before save.
         val result = CaptureCoordinator.mapOutcome(saveResult, null, isDebug = true)
 
         assertTrue(result is CaptureResult.Success)
@@ -124,5 +124,27 @@ class CaptureCoordinatorTest {
 
         assertTrue(result is CaptureResult.Failure)
         assertEquals("Save failed: Write error", (result as CaptureResult.Failure).message)
+    }
+
+    @Test
+    fun mapOutcome_producesCorrectResultWithoutTimingCoupling() {
+        // CaptureResult no longer carries CaptureTiming; the UI snapshots timing
+        // directly from the tracker. Verify the mapping functions work cleanly
+        // without any timing parameter.
+        val saveResult = SaveOutcome(isSuccess = true)
+        val result = CaptureCoordinator.mapOutcome(saveResult, null, isDebug = false)
+
+        assertTrue(result is CaptureResult.Success)
+        assertEquals("Saved to gallery", (result as CaptureResult.Success).message)
+    }
+
+    @Test
+    fun mapException_producesCleanResultWithoutTimingCoupling() {
+        val exception = RuntimeException("Some error")
+        val result = CaptureCoordinator.mapException(exception)
+
+        assertTrue(result is CaptureResult.Failure)
+        assertEquals("Capture failed: system error", (result as CaptureResult.Failure).message)
+        assertEquals(exception, (result as CaptureResult.Failure).cause)
     }
 }

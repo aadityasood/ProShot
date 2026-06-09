@@ -64,6 +64,8 @@ import androidx.core.content.ContextCompat
 import com.proshot.app.camera.CameraCapabilitiesMapper
 import com.proshot.app.camera.CaptureCoordinator
 import com.proshot.app.camera.CaptureResult
+import com.proshot.app.camera.CaptureTiming
+import com.proshot.app.camera.CaptureTimingTracker
 import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
@@ -243,9 +245,17 @@ private fun ActivePreviewContent(
     }
     val scope = rememberCoroutineScope()
 
+    var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
+    var activeTimingTracker by remember { mutableStateOf<CaptureTimingTracker?>(null) }
+    var capturePipelineStart by remember { mutableStateOf<Long?>(null) }
+    var captureRebindStart by remember { mutableStateOf<Long?>(null) }
+
     // Resolve ProcessCameraProvider off the main thread using cancellable coroutine.
     // This replaces the uncancellable addListener pattern.
     LaunchedEffect(lifecycleOwner, previewView, previewTrigger) {
+        val startRebind = captureRebindStart
+        val startPipeline = capturePipelineStart
+        val activeTracker = activeTimingTracker
         try {
             val provider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
                 val future = ProcessCameraProvider.getInstance(context)
@@ -279,12 +289,28 @@ private fun ActivePreviewContent(
                 cameraSelector,
                 previewUseCase
             )
+
+            if (activeTracker != null && startRebind != null && startPipeline != null) {
+                activeTracker.previewRebindMs = (System.nanoTime() - startRebind) / 1_000_000L
+                activeTracker.totalCapturePipelineMs = (System.nanoTime() - startPipeline) / 1_000_000L
+                lastCaptureTiming = activeTracker.toCaptureTiming()
+            }
         } catch (e: CancellationException) {
-            Log.d(TAG, "CameraX preview binding cancelled during lifecycle change", e)
             throw e
         } catch (e: Exception) {
+            if (activeTracker != null && startRebind != null && startPipeline != null) {
+                activeTracker.previewRebindMs = (System.nanoTime() - startRebind) / 1_000_000L
+                activeTracker.totalCapturePipelineMs = (System.nanoTime() - startPipeline) / 1_000_000L
+                lastCaptureTiming = activeTracker.toCaptureTiming()
+            }
             Log.e(TAG, "Failed to bind CameraX preview", e)
             onCameraError("Camera could not start. Please try again.")
+        } finally {
+            if (activeTimingTracker != null) {
+                activeTimingTracker = null
+                capturePipelineStart = null
+                captureRebindStart = null
+            }
         }
     }
 
@@ -359,7 +385,7 @@ private fun ActivePreviewContent(
                         .align(Alignment.TopStart)
                         .padding(top = 48.dp, start = 16.dp)
                 ) {
-                    DebugStatusOverlay(capabilities, decision)
+                    DebugStatusOverlay(capabilities, decision, lastCaptureTiming)
                 }
             }
         }
@@ -407,20 +433,35 @@ private fun ActivePreviewContent(
                     isCapturing = true
                     captureStatusMessage = "Taking photo..."
                     scope.launch {
+                        val tracker = if (isDebugBuild) CaptureTimingTracker() else null
+                        val pipelineStart = if (isDebugBuild) System.nanoTime() else null
+                        activeTimingTracker = tracker
+                        capturePipelineStart = pipelineStart
+
                         try {
+                            val unbindStart = if (isDebugBuild) System.nanoTime() else null
                             // 1. Explicitly unbind all CameraX use cases from the provider on Main thread
                             withContext(Dispatchers.Main) {
                                 cameraProvider?.unbindAll()
+                            }
+                            if (tracker != null && unbindStart != null) {
+                                tracker.previewUnbindMs = (System.nanoTime() - unbindStart) / 1_000_000L
                             }
 
                             // 2. Delegate capture orchestration and background dispatch to CaptureCoordinator
                             val result = CaptureCoordinator.executeCapture(
                                 context = context,
                                 lookProfile = lookProfile,
-                                isDebug = isDebugBuild
+                                isDebug = isDebugBuild,
+                                tracker = tracker
                             ) { status ->
                                 // Map coordinator progress to beginner-safe vocabulary.
                                 captureStatusMessage = mapStatusForDisplay(status)
+                            }
+
+                            // Store timing snapshot intermediate result (without rebind yet)
+                            if (tracker != null) {
+                                lastCaptureTiming = tracker.toCaptureTiming()
                             }
 
                             // 3. Map high-level result to the UI status message
@@ -433,6 +474,9 @@ private fun ActivePreviewContent(
                             throw e
                         } finally {
                             isCapturing = false
+                            if (isDebugBuild) {
+                                captureRebindStart = System.nanoTime()
+                            }
                             // 4. Guaranteed preview rebound by incrementing reactive key
                             previewTrigger++
                         }
@@ -522,7 +566,8 @@ private fun ShutterButton(
 @Composable
 private fun DebugStatusOverlay(
     capabilities: DeviceCameraCapabilities,
-    decision: CompatibilityDecision
+    decision: CompatibilityDecision,
+    lastCaptureTiming: CaptureTiming?
 ) {
     Column(
         modifier = Modifier
@@ -567,6 +612,15 @@ private fun DebugStatusOverlay(
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace
         )
+        if (lastCaptureTiming != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = lastCaptureTiming.formatDiagnostics(),
+                color = Color.Green,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
     }
 }
 

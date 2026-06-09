@@ -28,7 +28,10 @@ sealed class CaptureResult {
      * @property message A friendly, localized error description suitable for UI presentation.
      * @property cause The raw underlying exception, if any, for diagnostic logging.
      */
-    data class Failure(val message: String, val cause: Throwable? = null) : CaptureResult()
+    data class Failure(
+        val message: String,
+        val cause: Throwable? = null
+    ) : CaptureResult()
 }
 
 /**
@@ -65,18 +68,20 @@ object CaptureCoordinator {
         context: Context,
         lookProfile: LookProfile,
         isDebug: Boolean,
+        tracker: CaptureTimingTracker? = null,
         statusCallback: StatusCallback
     ): CaptureResult {
         return try {
             statusCallback.onStatusChanged("Initiating capture...")
             val frame = withContext(Dispatchers.Default) {
-                SingleFrameCaptureController.captureSingleFrame(context)
+                SingleFrameCaptureController.captureSingleFrame(context, tracker)
             }
             val outputRotationDegrees = withContext(Dispatchers.IO) {
                 SingleFrameCaptureController.resolveOutputRotationDegrees(context)
             }
 
             statusCallback.onStatusChanged("Encoding captured frame...")
+            val conversionStart = tracker?.let { System.nanoTime() }
             val orientedNv21 = withContext(Dispatchers.Default) {
                 val nv21 = CapturedImageEncoder.yuv420ToNv21(frame)
                 CapturedImageEncoder.rotateNv21(
@@ -86,11 +91,15 @@ object CaptureCoordinator {
                     rotationDegrees = outputRotationDegrees
                 )
             }
+            if (conversionStart != null) {
+                tracker?.yuvToNv21AndRotateMs = (System.nanoTime() - conversionStart) / 1_000_000L
+            }
 
             val captureTimestampMs = System.currentTimeMillis()
 
             var baselineSaveResult: GallerySaveResult? = null
             if (isDebug) {
+                val baselineSaveStart = tracker?.let { System.nanoTime() }
                 val baselineJpegBytes = withContext(Dispatchers.Default) {
                     CapturedImageEncoder.compressNv21ToJpeg(
                         nv21 = orientedNv21.data,
@@ -105,6 +114,9 @@ object CaptureCoordinator {
                     timestampMs = captureTimestampMs,
                     filenameSuffix = "baseline"
                 )
+                if (baselineSaveStart != null) {
+                    tracker?.baselineSaveMs = (System.nanoTime() - baselineSaveStart) / 1_000_000L
+                }
             }
 
             // Wrap post-baseline stages so that if processing, compression, or
@@ -112,10 +124,15 @@ object CaptureCoordinator {
             // returns a partial-save diagnostic message instead of a generic failure.
             try {
                 statusCallback.onStatusChanged("Processing photo...")
+                val processStart = tracker?.let { System.nanoTime() }
                 val processedNv21 = withContext(Dispatchers.Default) {
                     LookProfileNv21Processor.apply(orientedNv21, lookProfile)
                 }
+                if (processStart != null) {
+                    tracker?.lookProfileProcessMs = (System.nanoTime() - processStart) / 1_000_000L
+                }
 
+                val naturalSaveStart = tracker?.let { System.nanoTime() }
                 val jpegBytes = withContext(Dispatchers.Default) {
                     CapturedImageEncoder.compressNv21ToJpeg(
                         nv21 = processedNv21.data,
@@ -131,6 +148,9 @@ object CaptureCoordinator {
                     timestampMs = captureTimestampMs,
                     filenameSuffix = if (isDebug) "natural" else null
                 )
+                if (naturalSaveStart != null) {
+                    tracker?.naturalSaveMs = (System.nanoTime() - naturalSaveStart) / 1_000_000L
+                }
 
                 mapOutcome(saveResult, baselineSaveResult, isDebug)
             } catch (e: CancellationException) {

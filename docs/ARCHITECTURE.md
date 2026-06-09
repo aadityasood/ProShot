@@ -104,6 +104,9 @@ enhancements with the ProShot Natural color profile.
 > look profile color science mapping, and gallery output saving, running stages on appropriate background
 > thread dispatchers (`Dispatchers.Default` for pixel work and `Dispatchers.IO` for MediaStore interactions).
 
+> **Capture Latency Diagnostics:**
+> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds.
+
 ## Data Types
 
 ```kotlin
