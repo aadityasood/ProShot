@@ -20,6 +20,8 @@ data class CaptureTiming(
 ) {
     /**
      * Formats the timing stages into a clean multiline diagnostic string.
+     * Note: AE Warm-up and AF Wait/Lock latencies are measured sequentially
+     * during their respective pre-capture phases.
      */
     fun formatDiagnostics(): String {
         val sb = StringBuilder()

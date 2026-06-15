@@ -105,7 +105,10 @@ enhancements with the ProShot Natural color profile.
 > thread dispatchers (`Dispatchers.Default` for pixel work and `Dispatchers.IO` for MediaStore interactions).
 
 > **Capture Latency Diagnostics:**
-> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds.
+> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds. AE warm-up and AF wait latencies are measured sequentially in separate pre-capture phases to maximize focus and exposure reliability.
+
+> **Pre-Capture AF/AE Policy:**
+> Pre-capture is executed in sequential phases: a bounded AE warm-up phase (gate min 3, max 12 frames), followed by a bounded AF wait/lock phase (gate min 2, max 30 frames). Focus-readiness rules ensure that: (1) null AF state is never accepted as ready in active AF modes (AUTO, CONTINUOUS_PICTURE); this prevents premature exit on Qualcomm HALs where null appears during trigger processing; (2) `AF_TRIGGER_MIN_FRAMES=2` guards against early repeating results before the trigger takes effect; (3) `FOCUSED_LOCKED` is accepted as a terminal converged state in all known AF modes; (4) CONTINUOUS_PICTURE mode accepts both `FOCUSED_LOCKED` and `PASSIVE_FOCUSED` once the minimum gate is met; (5) fixed-focus cameras skip the AF wait completely; (6) unknown active AF modes fail closed and wait for the bounded frame cap rather than silently accepting unfocused output.
 
 ## Data Types
 

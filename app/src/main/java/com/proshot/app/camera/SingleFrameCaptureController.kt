@@ -34,6 +34,12 @@ private const val TAG = "SingleFrameCaptureController"
 private const val CAPTURE_TIMEOUT_MS = 8_000L
 private const val AE_WARMUP_MIN_FRAMES = 3
 private const val AE_WARMUP_MAX_FRAMES = 12
+
+// Minimum callbacks before any focused state is accepted. Does not guarantee
+// the trigger frame has been delivered; the trigger result may arrive at
+// frame 3 or later on pipeline-depth-3 HALs. Null and passive states are
+// rejected in active modes regardless, preventing premature exit on
+// pre-trigger callbacks.
 private const val AF_TRIGGER_MIN_FRAMES = 2
 private const val AF_LOCK_MAX_FRAMES = 30
 
@@ -136,22 +142,27 @@ object SingleFrameCaptureController {
      * because passive AF converges without an explicit trigger. `PASSIVE_UNFOCUSED`
      * keeps waiting until the frame cap for the same close-subject reason.
      *
-     * A null AF state is treated as ready because LEGACY hardware level cameras do not
-     * report AF state, and [lockAutoFocusBeforeCapture] is called whenever any triggerable
-     * AF mode is available, including on LEGACY devices that expose `AUTO` or
-     * `CONTINUOUS_PICTURE` without supporting the full AF state machine. On non-LEGACY
-     * cameras a null state may also appear briefly before the AF state machine initializes;
-     * the [AF_TRIGGER_MIN_FRAMES] gate filters these transient nulls, and the
-     * [AF_LOCK_MAX_FRAMES] cap prevents infinite wait in either case.
-     *
-     * The log in [lockAutoFocusBeforeCapture] distinguishes a null-state exit from a
-     * focused-lock exit for diagnostic visibility.
+     * Null AF state is not ready in active AF modes.
      */
-    fun isAutoFocusReadyForStillCapture(afState: Int?, afMode: Int): Boolean {
-        return afState == null ||
-            afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-            (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
-                afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED)
+    fun isAutoFocusReadyForStillCapture(frameCount: Int, afState: Int?, afMode: Int?): Boolean {
+        if (afMode == null) {
+            return true
+        }
+        if (frameCount < AF_TRIGGER_MIN_FRAMES) {
+            return false
+        }
+        return when (afMode) {
+            CaptureRequest.CONTROL_AF_MODE_AUTO -> {
+                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+            }
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> {
+                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+            }
+            // Unknown active AF modes fail closed: wait for the bounded
+            // frame cap rather than silently accepting unfocused output.
+            else -> false
+        }
     }
 
     /**
@@ -358,7 +369,9 @@ object SingleFrameCaptureController {
                 tracker?.aeWarmupMs = (System.nanoTime() - warmupStart) / 1_000_000L
             }
 
-            val afStart = tracker?.let { System.nanoTime() }
+            // Only time AF when AF locking is active; fixed-focus cameras
+            // skip locking and intentionally record no AF duration.
+            val afStart = if (tracker != null && autoFocusMode != null) System.nanoTime() else null
             lockAutoFocusBeforeCapture(
                 device = device,
                 session = session,
@@ -466,7 +479,7 @@ object SingleFrameCaptureController {
             val isWarmupDone = AtomicBoolean(false)
             var frameCount = 0
 
-            fun finishWarmup() {
+            fun finishWarmup(timedOut: Boolean, aeState: Int?) {
                 if (!isWarmupDone.compareAndSet(false, true)) {
                     return
                 }
@@ -475,11 +488,15 @@ object SingleFrameCaptureController {
                 } catch (e: Exception) {
                     Log.w(TAG, "Unable to stop AE warmup repeating request", e)
                 }
-                // Drain while the listener is still active, so late-arriving warm-up
-                // frames are handled by the drain callback rather than piling up
-                // unacquired in the ImageReader. Remove listener only after drain.
                 drainImageReader(reader)
                 reader.setOnImageAvailableListener(null, null)
+
+                if (timedOut) {
+                    Log.w(TAG, "AE warmup hit frame cap of $AE_WARMUP_MAX_FRAMES frames (AE state=$aeState)")
+                } else {
+                    Log.d(TAG, "AE warmup completed successfully in $frameCount frames")
+                }
+
                 if (cont.isActive) {
                     cont.resume(Unit)
                 }
@@ -508,10 +525,10 @@ object SingleFrameCaptureController {
                         aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
                         aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
 
-                    if ((frameCount >= AE_WARMUP_MIN_FRAMES && aeReady) ||
-                        frameCount >= AE_WARMUP_MAX_FRAMES
-                    ) {
-                        finishWarmup()
+                    if (frameCount >= AE_WARMUP_MIN_FRAMES && aeReady) {
+                        finishWarmup(timedOut = false, aeState = aeState)
+                    } else if (frameCount >= AE_WARMUP_MAX_FRAMES) {
+                        finishWarmup(timedOut = true, aeState = aeState)
                     }
                 }
 
@@ -523,7 +540,7 @@ object SingleFrameCaptureController {
                     Log.w(TAG, "AE warmup frame failed: ${failure.reason}")
                     frameCount++
                     if (frameCount >= AE_WARMUP_MAX_FRAMES) {
-                        finishWarmup()
+                        finishWarmup(timedOut = true, aeState = null)
                     }
                 }
             }
@@ -567,7 +584,7 @@ object SingleFrameCaptureController {
             val isFocusDone = AtomicBoolean(false)
             var frameCount = 0
 
-            fun finishFocusWait() {
+            fun finishFocusWait(timedOut: Boolean, afState: Int?) {
                 if (!isFocusDone.compareAndSet(false, true)) {
                     return
                 }
@@ -578,6 +595,13 @@ object SingleFrameCaptureController {
                 }
                 drainImageReader(reader)
                 reader.setOnImageAvailableListener(null, null)
+
+                if (timedOut) {
+                    Log.w(TAG, "AF lock hit frame cap of $AF_LOCK_MAX_FRAMES frames (AF state=$afState)")
+                } else {
+                    Log.d(TAG, "AF lock completed successfully in $frameCount frames (AF state=$afState)")
+                }
+
                 if (cont.isActive) {
                     cont.resume(Unit)
                 }
@@ -594,20 +618,11 @@ object SingleFrameCaptureController {
                     result: android.hardware.camera2.TotalCaptureResult
                 ) {
                     frameCount++
-                    // Wait for at least AF_TRIGGER_MIN_FRAMES results before
-                    // evaluating AF state. This gives the HAL time to process
-                    // the latest repeating request and, in AUTO mode, the
-                    // queued AF trigger. Without this gate, the first callback
-                    // can report stale PASSIVE_FOCUSED and preserve old focus.
-                    if (frameCount < AF_TRIGGER_MIN_FRAMES) return
                     val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-                    if (isAutoFocusReadyForStillCapture(afState, autoFocusMode!!)) {
-                        val reason = if (afState == null) "null AF state (LEGACY/uninitialized)" else "AF state=$afState"
-                        Log.d(TAG, "AF wait finished after $frameCount frames: focused ($reason)")
-                        finishFocusWait()
+                    if (isAutoFocusReadyForStillCapture(frameCount, afState, autoFocusMode)) {
+                        finishFocusWait(timedOut = false, afState = afState)
                     } else if (frameCount >= AF_LOCK_MAX_FRAMES) {
-                        Log.w(TAG, "AF wait hit frame cap after $frameCount frames with state=$afState (focus may not have converged)")
-                        finishFocusWait()
+                        finishFocusWait(timedOut = true, afState = afState)
                     }
                 }
 
@@ -619,7 +634,7 @@ object SingleFrameCaptureController {
                     frameCount++
                     Log.w(TAG, "AF lock frame failed: ${failure.reason}")
                     if (frameCount >= AF_LOCK_MAX_FRAMES) {
-                        finishFocusWait()
+                        finishFocusWait(timedOut = true, afState = null)
                     }
                 }
             }
@@ -632,10 +647,6 @@ object SingleFrameCaptureController {
                 }
                 session.setRepeatingRequest(repeatingRequest.build(), callback, handler)
 
-                // Only send AF_TRIGGER_START for AUTO mode. In CONTINUOUS_PICTURE
-                // mode, passive AF converges without an explicit trigger; sending
-                // TRIGGER_START in CONTINUOUS_PICTURE can produce incorrect lock
-                // behavior on some Qualcomm HALs.
                 if (autoFocusMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
                     val triggerRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(reader.surface)
