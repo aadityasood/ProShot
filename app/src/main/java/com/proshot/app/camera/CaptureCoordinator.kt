@@ -69,12 +69,13 @@ object CaptureCoordinator {
         lookProfile: LookProfile,
         isDebug: Boolean,
         tracker: CaptureTimingTracker? = null,
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
         statusCallback: StatusCallback
     ): CaptureResult {
         return try {
             statusCallback.onStatusChanged("Initiating capture...")
             val frame = withContext(Dispatchers.Default) {
-                SingleFrameCaptureController.captureSingleFrame(context, tracker)
+                SingleFrameCaptureController.captureSingleFrame(context, tracker, diagnosticsTracker)
             }
             val outputRotationDegrees = withContext(Dispatchers.IO) {
                 SingleFrameCaptureController.resolveOutputRotationDegrees(context)

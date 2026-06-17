@@ -45,21 +45,25 @@ data class CaptureTiming(
 
 /**
  * A mutable tracker used by pipeline stages to collect execution durations.
+ *
+ * Fields are marked `@Volatile` because the tracker is written on background
+ * threads (camera handler / `Dispatchers.Default`) and read on the main thread
+ * when `toCaptureTiming()` is called for the debug HUD.
  */
 class CaptureTimingTracker {
-    var previewUnbindMs: Long? = null
-    var cameraOpenMs: Long? = null
-    var sessionConfigMs: Long? = null
-    var aeWarmupMs: Long? = null
-    var afWaitMs: Long? = null
-    var stillCaptureMs: Long? = null
-    var totalCamera2CaptureMs: Long? = null
-    var yuvToNv21AndRotateMs: Long? = null
-    var baselineSaveMs: Long? = null
-    var lookProfileProcessMs: Long? = null
-    var naturalSaveMs: Long? = null
-    var previewRebindMs: Long? = null
-    var totalCapturePipelineMs: Long? = null
+    @Volatile var previewUnbindMs: Long? = null
+    @Volatile var cameraOpenMs: Long? = null
+    @Volatile var sessionConfigMs: Long? = null
+    @Volatile var aeWarmupMs: Long? = null
+    @Volatile var afWaitMs: Long? = null
+    @Volatile var stillCaptureMs: Long? = null
+    @Volatile var totalCamera2CaptureMs: Long? = null
+    @Volatile var yuvToNv21AndRotateMs: Long? = null
+    @Volatile var baselineSaveMs: Long? = null
+    @Volatile var lookProfileProcessMs: Long? = null
+    @Volatile var naturalSaveMs: Long? = null
+    @Volatile var previewRebindMs: Long? = null
+    @Volatile var totalCapturePipelineMs: Long? = null
 
     fun toCaptureTiming(): CaptureTiming {
         return CaptureTiming(

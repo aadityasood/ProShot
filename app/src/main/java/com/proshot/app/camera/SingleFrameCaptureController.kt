@@ -199,10 +199,11 @@ object SingleFrameCaptureController {
      */
     suspend fun captureSingleFrame(
         context: Context,
-        tracker: CaptureTimingTracker? = null
+        tracker: CaptureTimingTracker? = null,
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
     ): CopiedImageFrame = withContext(Dispatchers.Default) {
         withTimeout(CAPTURE_TIMEOUT_MS) {
-            captureSingleFrameOnCurrentThread(context, tracker)
+            captureSingleFrameOnCurrentThread(context, tracker, diagnosticsTracker)
         }
     }
 
@@ -210,7 +211,8 @@ object SingleFrameCaptureController {
     @SuppressLint("MissingPermission")
     private suspend fun captureSingleFrameOnCurrentThread(
         context: Context,
-        tracker: CaptureTimingTracker? = null
+        tracker: CaptureTimingTracker? = null,
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
     ): CopiedImageFrame {
         val totalStart = tracker?.let { System.nanoTime() }
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
@@ -218,6 +220,10 @@ object SingleFrameCaptureController {
 
         // 1. Resolve primary physical back camera
         val cameraId = resolvePrimaryCameraId(manager)
+        if (diagnosticsTracker != null) {
+            diagnosticsTracker.logicalCameraId = cameraId
+            diagnosticsTracker.afWaitExitReason = "NOT_RUN"
+        }
 
         val characteristics = manager.getCameraCharacteristics(cameraId)
         val availableAutoFocusModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
@@ -225,6 +231,27 @@ object SingleFrameCaptureController {
             Log.w(TAG, "CONTROL_AF_AVAILABLE_MODES characteristic is null; assuming fixed-focus")
         }
         val autoFocusMode = selectAutoFocusModeForStillCapture(availableAutoFocusModes)
+        if (diagnosticsTracker != null) {
+            diagnosticsTracker.physicalCameraIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                characteristics.physicalCameraIds.toList()
+            } else {
+                emptyList()
+            }
+            diagnosticsTracker.lensFacing = FocusLensDiagnosticsHelper.mapLensFacing(
+                characteristics.get(CameraCharacteristics.LENS_FACING)
+            )
+            diagnosticsTracker.hardwareLevel = FocusLensDiagnosticsHelper.mapHardwareLevel(
+                characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+            )
+            diagnosticsTracker.focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList()
+            diagnosticsTracker.minFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+            diagnosticsTracker.hyperfocalDistance = characteristics.get(CameraCharacteristics.LENS_INFO_HYPERFOCAL_DISTANCE)
+            diagnosticsTracker.availableAfModes =
+                characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toList()?.mapNotNull {
+                    FocusLensDiagnosticsHelper.mapAfMode(it)
+                }
+            diagnosticsTracker.selectedAfMode = FocusLensDiagnosticsHelper.mapAfMode(autoFocusMode)
+        }
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
 
@@ -363,21 +390,22 @@ object SingleFrameCaptureController {
                 session = session,
                 reader = reader,
                 handler = handler,
-                autoFocusMode = autoFocusMode
+                autoFocusMode = autoFocusMode,
+                diagnosticsTracker = diagnosticsTracker
             )
             if (warmupStart != null) {
                 tracker?.aeWarmupMs = (System.nanoTime() - warmupStart) / 1_000_000L
             }
 
-            // Only time AF when AF locking is active; fixed-focus cameras
-            // skip locking and intentionally record no AF duration.
+            // Only time and lock autofocus if camera has a triggerable AF mode
             val afStart = if (tracker != null && autoFocusMode != null) System.nanoTime() else null
             lockAutoFocusBeforeCapture(
                 device = device,
                 session = session,
                 reader = reader,
                 handler = handler,
-                autoFocusMode = autoFocusMode
+                autoFocusMode = autoFocusMode,
+                diagnosticsTracker = diagnosticsTracker
             )
             if (afStart != null) {
                 tracker?.afWaitMs = (System.nanoTime() - afStart) / 1_000_000L
@@ -396,6 +424,12 @@ object SingleFrameCaptureController {
                             Log.d(TAG, "Native frame acquired, copying immediately")
                             // Copy must be completed before native close or resume handoff
                             val frame = CopiedImageFrame.copyFrom(image)
+                            if (diagnosticsTracker != null) {
+                                diagnosticsTracker.copiedImageTimestamp = frame.timestamp
+                                diagnosticsTracker.captureWidth = frame.width
+                                diagnosticsTracker.captureHeight = frame.height
+                                diagnosticsTracker.imageFormat = "YUV_420_888"
+                            }
 
                             if (isCompleted.compareAndSet(false, true) && cont.isActive) {
                                 Log.d(TAG, "YUV_420_888 frame successfully heap-copied")
@@ -425,7 +459,21 @@ object SingleFrameCaptureController {
                     CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE
                 )
 
-                session.capture(builder.build(), null, handler)
+                val stillCallback = object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: android.hardware.camera2.TotalCaptureResult
+                    ) {
+                        val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                        Log.d(TAG, "Still capture completed, sensor timestamp: $ts ns")
+                        if (diagnosticsTracker != null && ts != null) {
+                            diagnosticsTracker.stillCaptureResultTimestamp = ts
+                        }
+                    }
+                }
+
+                session.capture(builder.build(), stillCallback, handler)
 
                 cont.invokeOnCancellation {
                     isCompleted.set(true)
@@ -473,7 +521,8 @@ object SingleFrameCaptureController {
         session: CameraCaptureSession,
         reader: ImageReader,
         handler: Handler,
-        autoFocusMode: Int?
+        autoFocusMode: Int?,
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
     ) {
         suspendCancellableCoroutine<Unit> { cont ->
             val isWarmupDone = AtomicBoolean(false)
@@ -482,6 +531,11 @@ object SingleFrameCaptureController {
             fun finishWarmup(timedOut: Boolean, aeState: Int?) {
                 if (!isWarmupDone.compareAndSet(false, true)) {
                     return
+                }
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.aeWarmupExitState = FocusLensDiagnosticsHelper.mapAeState(aeState)
+                        ?: if (timedOut) "NULL_TIMEOUT" else "NULL_CONVERGED"
+                    diagnosticsTracker.aeWarmupFrameCount = frameCount
                 }
                 try {
                     session.stopRepeating()
@@ -573,10 +627,14 @@ object SingleFrameCaptureController {
         session: CameraCaptureSession,
         reader: ImageReader,
         handler: Handler,
-        autoFocusMode: Int?
+        autoFocusMode: Int?,
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
     ) {
         if (autoFocusMode == null) {
             Log.d(TAG, "Skipping AF lock because camera reports fixed-focus/no triggerable AF")
+            if (diagnosticsTracker != null) {
+                diagnosticsTracker.afWaitExitReason = "FIXED_FOCUS"
+            }
             return
         }
 
@@ -587,6 +645,11 @@ object SingleFrameCaptureController {
             fun finishFocusWait(timedOut: Boolean, afState: Int?) {
                 if (!isFocusDone.compareAndSet(false, true)) {
                     return
+                }
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.afWaitExitState = FocusLensDiagnosticsHelper.mapAfState(afState) ?: "UNKNOWN"
+                    diagnosticsTracker.afWaitFrameCount = frameCount
+                    diagnosticsTracker.afWaitExitReason = if (timedOut) "FRAME_CAP_TIMEOUT" else "FOCUSED"
                 }
                 try {
                     session.stopRepeating()

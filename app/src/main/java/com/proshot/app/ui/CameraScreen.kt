@@ -66,6 +66,8 @@ import com.proshot.app.camera.CaptureCoordinator
 import com.proshot.app.camera.CaptureResult
 import com.proshot.app.camera.CaptureTiming
 import com.proshot.app.camera.CaptureTimingTracker
+import com.proshot.app.camera.FocusLensDiagnostics
+import com.proshot.app.camera.FocusLensDiagnosticsTracker
 import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
@@ -246,6 +248,7 @@ private fun ActivePreviewContent(
     val scope = rememberCoroutineScope()
 
     var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
+    var lastFocusLensDiagnostics by remember { mutableStateOf<FocusLensDiagnostics?>(null) }
     var activeTimingTracker by remember { mutableStateOf<CaptureTimingTracker?>(null) }
     var capturePipelineStart by remember { mutableStateOf<Long?>(null) }
     var captureRebindStart by remember { mutableStateOf<Long?>(null) }
@@ -385,7 +388,7 @@ private fun ActivePreviewContent(
                         .align(Alignment.TopStart)
                         .padding(top = 48.dp, start = 16.dp)
                 ) {
-                    DebugStatusOverlay(capabilities, decision, lastCaptureTiming)
+                    DebugStatusOverlay(capabilities, decision, lastCaptureTiming, lastFocusLensDiagnostics)
                 }
             }
         }
@@ -434,6 +437,7 @@ private fun ActivePreviewContent(
                     captureStatusMessage = "Taking photo..."
                     scope.launch {
                         val tracker = if (isDebugBuild) CaptureTimingTracker() else null
+                        val diagnosticsTracker = if (isDebugBuild) FocusLensDiagnosticsTracker() else null
                         val pipelineStart = if (isDebugBuild) System.nanoTime() else null
                         activeTimingTracker = tracker
                         capturePipelineStart = pipelineStart
@@ -453,7 +457,8 @@ private fun ActivePreviewContent(
                                 context = context,
                                 lookProfile = lookProfile,
                                 isDebug = isDebugBuild,
-                                tracker = tracker
+                                tracker = tracker,
+                                diagnosticsTracker = diagnosticsTracker
                             ) { status ->
                                 // Map coordinator progress to beginner-safe vocabulary.
                                 captureStatusMessage = mapStatusForDisplay(status)
@@ -462,6 +467,9 @@ private fun ActivePreviewContent(
                             // Store timing snapshot intermediate result (without rebind yet)
                             if (tracker != null) {
                                 lastCaptureTiming = tracker.toCaptureTiming()
+                            }
+                            if (diagnosticsTracker != null) {
+                                lastFocusLensDiagnostics = diagnosticsTracker.snapshot()
                             }
 
                             // 3. Map high-level result to the UI status message
@@ -567,7 +575,8 @@ private fun ShutterButton(
 private fun DebugStatusOverlay(
     capabilities: DeviceCameraCapabilities,
     decision: CompatibilityDecision,
-    lastCaptureTiming: CaptureTiming?
+    lastCaptureTiming: CaptureTiming?,
+    lastFocusLensDiagnostics: FocusLensDiagnostics?
 ) {
     Column(
         modifier = Modifier
@@ -616,6 +625,15 @@ private fun DebugStatusOverlay(
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = lastCaptureTiming.formatDiagnostics(),
+                color = Color.Green,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+        if (lastFocusLensDiagnostics != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = lastFocusLensDiagnostics.formatDiagnostics(),
                 color = Color.Green,
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace
