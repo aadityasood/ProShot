@@ -263,4 +263,62 @@ class FocusLensDiagnosticsTest {
         assertTrue(formatted.contains("Copied TS: 5000ns"))
         assertFalse(formatted.contains("Still TS"))
     }
+
+    @Test
+    fun formatDiagnostics_showsNewFocusTargetAndRegionFields() {
+        val model = FocusLensDiagnostics(
+            focusTargetSource = "DEFAULT_CENTER",
+            normalizedTargetX = 0.5f,
+            normalizedTargetY = 0.5f,
+            normalizedAfSize = 0.04f,
+            normalizedAeSize = 0.10f,
+            afMaxRegions = 1,
+            aeMaxRegions = 1,
+            afRegionApplied = "Rect(1920, 1440, 160x120)",
+            aeRegionApplied = "Rect(1800, 1350, 400x300)"
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("Focus Source: DEFAULT_CENTER"))
+        assertTrue(formatted.contains("Normalized Target: (0.5, 0.5)"))
+        assertTrue(formatted.contains("Normalized AF Size: 0.04"))
+        assertTrue(formatted.contains("Normalized AE Size: 0.10"))
+        assertTrue(formatted.contains("Max AF Regions: 1"))
+        assertTrue(formatted.contains("Max AE Regions: 1"))
+        assertTrue(formatted.contains("AF Region: Rect(1920, 1440, 160x120)"))
+        assertTrue(formatted.contains("AE Region: Rect(1800, 1350, 400x300)"))
+    }
+
+    @Test
+    fun formatDiagnostics_showsZeroRegionFallbackPolicy() {
+        val model = FocusLensDiagnostics(
+            focusTargetSource = "DEFAULT_CENTER",
+            normalizedTargetX = 0.5f,
+            normalizedTargetY = 0.5f,
+            afMaxRegions = 0,
+            aeMaxRegions = 0,
+            afRegionApplied = "NONE_UNSUPPORTED",
+            aeRegionApplied = "NONE_UNSUPPORTED"
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("Focus Source: DEFAULT_CENTER"))
+        assertTrue(formatted.contains("Normalized Target: (0.5, 0.5)"))
+        assertTrue(formatted.contains("Max AF Regions: 0"))
+        assertTrue(formatted.contains("Max AE Regions: 0"))
+        assertTrue(formatted.contains("AF Region: NONE_UNSUPPORTED"))
+        assertTrue(formatted.contains("AE Region: NONE_UNSUPPORTED"))
+    }
+
+    @Test
+    fun formatDiagnostics_showsActiveArrayNullFallbackEvenIfMaxRegionsAreZero() {
+        val model = FocusLensDiagnostics(
+            focusTargetSource = "DEFAULT_CENTER",
+            afMaxRegions = 0,
+            aeMaxRegions = 0,
+            afRegionApplied = "NONE_ACTIVE_ARRAY_NULL",
+            aeRegionApplied = "NONE_ACTIVE_ARRAY_NULL"
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("AF Region: NONE_ACTIVE_ARRAY_NULL"))
+        assertTrue(formatted.contains("AE Region: NONE_ACTIVE_ARRAY_NULL"))
+    }
 }

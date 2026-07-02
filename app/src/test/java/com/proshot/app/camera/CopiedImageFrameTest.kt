@@ -201,7 +201,7 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun selectAutoFocusModeForStillCapture_prefersAutoForTriggerLock() {
+    fun selectAutoFocusModeForStillCapture_prefersContinuousPictureForStillCapture() {
         val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
             intArrayOf(
                 CaptureRequest.CONTROL_AF_MODE_OFF,
@@ -210,19 +210,19 @@ class CopiedImageFrameTest {
             )
         )
 
-        assertEquals(CaptureRequest.CONTROL_AF_MODE_AUTO, selected)
+        assertEquals(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, selected)
     }
 
     @Test
-    fun selectAutoFocusModeForStillCapture_fallsBackToContinuousPictureWhenAutoUnavailable() {
+    fun selectAutoFocusModeForStillCapture_fallsBackToAutoWhenContinuousPictureUnavailable() {
         val selected = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
             intArrayOf(
                 CaptureRequest.CONTROL_AF_MODE_OFF,
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                CaptureRequest.CONTROL_AF_MODE_AUTO
             )
         )
 
-        assertEquals(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, selected)
+        assertEquals(CaptureRequest.CONTROL_AF_MODE_AUTO, selected)
     }
 
     @Test
@@ -242,23 +242,79 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun isAutoFocusReadyForStillCapture_respectsMinimumGateFrameCount() {
+    fun isAutoFocusReadyForStillCapture_autoGate_focusedLockedReadyAtFrame2() {
         val autoMode = CaptureRequest.CONTROL_AF_MODE_AUTO
-        val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
         val locked = CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-        val passiveFocused = CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
 
-        // Under the gate of 2 frames, active AF modes should not be ready even if focused/locked
+        // Under the AUTO gate of 2 frames, FOCUSED_LOCKED is not ready
         assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(0, locked, autoMode))
         assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(1, locked, autoMode))
-        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(0, passiveFocused, continuousMode))
-        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(1, passiveFocused, continuousMode))
 
-        // At or above 2 frames, they are ready
+        // At exactly 2 frames (gate boundary), AUTO FOCUSED_LOCKED is ready
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(2, locked, autoMode))
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(3, locked, autoMode))
-        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(2, passiveFocused, continuousMode))
-        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(3, passiveFocused, continuousMode))
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_continuousGate_passiveFocusedFalseBeforeFrame8() {
+        val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        val passiveFocused = CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+
+        // PASSIVE_FOCUSED must be rejected at frames 0-7 in CONTINUOUS_PICTURE mode.
+        // In a fresh Camera2 session, PASSIVE_FOCUSED in the first ~267 ms may be
+        // stale carry-over from the prior CameraX session's lens position.
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(0, passiveFocused, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(1, passiveFocused, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(2, passiveFocused, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(4, passiveFocused, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(7, passiveFocused, continuousMode))
+
+        // At exactly 8 frames (passive gate), PASSIVE_FOCUSED is ready
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(8, passiveFocused, continuousMode))
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(9, passiveFocused, continuousMode))
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_continuousGate_focusedLockedFalseBeforeFrame8() {
+        val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        val locked = CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+
+        // FOCUSED_LOCKED must also be gated by AF_PASSIVE_MIN_FRAMES in
+        // CONTINUOUS_PICTURE mode. If a prior session's lock state leaked, it
+        // could appear before the HAL ran a real scan cycle.
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(0, locked, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(2, locked, continuousMode))
+        assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(7, locked, continuousMode))
+
+        // At exactly 8 frames, FOCUSED_LOCKED is ready
+        assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(8, locked, continuousMode))
+    }
+
+    @Test
+    fun isAutoFocusReadyForStillCapture_continuousGate_rejectsNonFocusedStatesEvenAfterGate() {
+        val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        val pastGate = 10
+
+        // PASSIVE_UNFOCUSED, ACTIVE_SCAN, and null must never be accepted,
+        // even after the passive gate has been met
+        assertFalse(
+            "PASSIVE_UNFOCUSED must not be ready even after gate",
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                pastGate, CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED, continuousMode
+            )
+        )
+        assertFalse(
+            "ACTIVE_SCAN must not be ready even after gate",
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                pastGate, CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN, continuousMode
+            )
+        )
+        assertFalse(
+            "Null must not be ready even after gate",
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                pastGate, null, continuousMode
+            )
+        )
     }
 
     @Test
@@ -324,7 +380,9 @@ class CopiedImageFrameTest {
     @Test
     fun isAutoFocusReadyForStillCapture_inContinuousPictureMode_acceptsFocusedStatesOnly() {
         val continuousMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-        val gateMet = 3
+        // Use a frame count past the passive gate (AF_PASSIVE_MIN_FRAMES = 8)
+        // to test state-acceptance logic independently of the gate
+        val gateMet = 10
 
         // Null AF state is not ready in active AF modes
         assertFalse(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(gateMet, null, continuousMode))
@@ -337,6 +395,9 @@ class CopiedImageFrameTest {
         )
 
         // Not-focused locked is a terminal focus failure, not a good capture state.
+        // No AF_TRIGGER_START is sent in CONTINUOUS_PICTURE, so this state should
+        // not arise. If it does (prior session leak or OEM HAL quirk), waiting
+        // for the frame cap is safer than capturing known-failed focus.
         assertFalse(
             "NOT_FOCUSED_LOCKED must not be accepted in CONTINUOUS_PICTURE mode",
             SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
