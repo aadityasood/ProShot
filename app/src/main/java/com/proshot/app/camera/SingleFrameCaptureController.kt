@@ -35,12 +35,19 @@ private const val CAPTURE_TIMEOUT_MS = 8_000L
 private const val AE_WARMUP_MIN_FRAMES = 3
 private const val AE_WARMUP_MAX_FRAMES = 12
 
-// Minimum callbacks before any focused state is accepted. Does not guarantee
-// the trigger frame has been delivered; the trigger result may arrive at
-// frame 3 or later on pipeline-depth-3 HALs. Null and passive states are
-// rejected in active modes regardless, preventing premature exit on
-// pre-trigger callbacks.
+// Minimum callbacks before FOCUSED_LOCKED is accepted in AUTO mode.
+// Does not guarantee the trigger frame has been delivered; the trigger
+// result may arrive at frame 3 or later on pipeline-depth-3 HALs.
 private const val AF_TRIGGER_MIN_FRAMES = 2
+
+// Minimum callbacks before PASSIVE_FOCUSED or FOCUSED_LOCKED is accepted
+// in CONTINUOUS_PICTURE mode. In a fresh Camera2 session the HAL may carry
+// PASSIVE_FOCUSED from the prior CameraX session's lens position. A gate
+// of 8 frames (~267 ms at 30 fps) exceeds the typical Qualcomm CDAF scan
+// initialization window and ensures the HAL has run at least one real scan
+// cycle on the current scene before the result is trusted.
+private const val AF_PASSIVE_MIN_FRAMES = 8
+
 private const val AF_LOCK_MAX_FRAMES = 30
 
 /**
@@ -110,10 +117,11 @@ object SingleFrameCaptureController {
     /**
      * Selects the autofocus mode to use for the one-shot still-capture lock sequence.
      *
-     * `AUTO` is preferred because it is the clearest mode for an explicit
-     * `CONTROL_AF_TRIGGER_START` before still capture. `CONTINUOUS_PICTURE` is a
-     * fallback for devices that do not expose `AUTO`. Returns null for fixed-focus
-     * devices where no autofocus trigger is useful.
+     * `CONTINUOUS_PICTURE` is preferred for the still-capture experiment because it
+     * lets the HAL converge passively on the center metering region before capture.
+     * `AUTO` remains the fallback for devices that do not expose continuous picture
+     * AF and is the only mode that receives an explicit `CONTROL_AF_TRIGGER_START`.
+     * Returns null for fixed-focus devices where no autofocus trigger is useful.
      */
     fun selectAutoFocusModeForStillCapture(availableModes: IntArray?): Int? {
         if (availableModes == null) {
@@ -121,9 +129,9 @@ object SingleFrameCaptureController {
         }
         val modes = availableModes.toSet()
         return when {
-            CaptureRequest.CONTROL_AF_MODE_AUTO in modes -> CaptureRequest.CONTROL_AF_MODE_AUTO
             CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            CaptureRequest.CONTROL_AF_MODE_AUTO in modes -> CaptureRequest.CONTROL_AF_MODE_AUTO
             else -> null
         }
     }
@@ -131,33 +139,37 @@ object SingleFrameCaptureController {
     /**
      * Returns true when an AF state is safe to leave the autofocus wait loop.
      *
-     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` is accepted after an explicit
-     * `AF_TRIGGER_START`. `NOT_FOCUSED_LOCKED` means the HAL finished scanning without
-     * focus, so the controller keeps waiting until the frame cap instead of immediately
-     * saving a soft close-subject photo. `PASSIVE_FOCUSED` and `PASSIVE_UNFOCUSED` are
-     * pre-trigger residual states from the warm-up phase and must not be accepted, or
-     * the lock phase exits before the trigger takes effect.
+     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` is accepted after
+     * [AF_TRIGGER_MIN_FRAMES] (2 frames). The trigger forces a deterministic
+     * scan cycle, so the gate only needs to exceed pipeline depth.
      *
-     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE` fallback, `PASSIVE_FOCUSED` is valid
-     * because passive AF converges without an explicit trigger. `PASSIVE_UNFOCUSED`
-     * keeps waiting until the frame cap for the same close-subject reason.
+     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE`, `PASSIVE_FOCUSED` and
+     * `FOCUSED_LOCKED` are accepted only after [AF_PASSIVE_MIN_FRAMES]
+     * (8 frames). In a fresh Camera2 session the HAL may carry
+     * `PASSIVE_FOCUSED` from the prior CameraX lens position — a stale
+     * state that does not reflect a scan of the current scene. The higher
+     * gate ensures the HAL has run at least one real passive scan cycle.
+     * `NOT_FOCUSED_LOCKED` is rejected because no `AF_TRIGGER_START` is
+     * sent in this mode — the state should not arise, but if it does
+     * (e.g., from a prior session or OEM HAL quirk), conservatively
+     * waiting for the frame cap is safer than capturing known-failed focus.
      *
-     * Null AF state is not ready in active AF modes.
+     * `PASSIVE_UNFOCUSED` keeps waiting in both modes for the same
+     * close-subject reason. Null AF state is never ready in active modes.
      */
     fun isAutoFocusReadyForStillCapture(frameCount: Int, afState: Int?, afMode: Int?): Boolean {
         if (afMode == null) {
             return true
         }
-        if (frameCount < AF_TRIGGER_MIN_FRAMES) {
-            return false
-        }
         return when (afMode) {
             CaptureRequest.CONTROL_AF_MODE_AUTO -> {
+                if (frameCount < AF_TRIGGER_MIN_FRAMES) return false
                 afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
             }
             CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> {
+                if (frameCount < AF_PASSIVE_MIN_FRAMES) return false
                 afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                        afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
             }
             // Unknown active AF modes fail closed: wait for the bounded
             // frame cap rather than silently accepting unfocused output.
@@ -200,10 +212,11 @@ object SingleFrameCaptureController {
     suspend fun captureSingleFrame(
         context: Context,
         tracker: CaptureTimingTracker? = null,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
+        focusTarget: FocusMeteringTarget = FocusMeteringTarget.center()
     ): CopiedImageFrame = withContext(Dispatchers.Default) {
         withTimeout(CAPTURE_TIMEOUT_MS) {
-            captureSingleFrameOnCurrentThread(context, tracker, diagnosticsTracker)
+            captureSingleFrameOnCurrentThread(context, tracker, diagnosticsTracker, focusTarget)
         }
     }
 
@@ -212,7 +225,8 @@ object SingleFrameCaptureController {
     private suspend fun captureSingleFrameOnCurrentThread(
         context: Context,
         tracker: CaptureTimingTracker? = null,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
+        focusTarget: FocusMeteringTarget = FocusMeteringTarget.center()
     ): CopiedImageFrame {
         val totalStart = tracker?.let { System.nanoTime() }
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
@@ -231,6 +245,18 @@ object SingleFrameCaptureController {
             Log.w(TAG, "CONTROL_AF_AVAILABLE_MODES characteristic is null; assuming fixed-focus")
         }
         val autoFocusMode = selectAutoFocusModeForStillCapture(availableAutoFocusModes)
+        val maxRegionsAfRaw = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF)
+        val maxRegionsAeRaw = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE)
+        if (maxRegionsAfRaw == null) {
+            Log.w(TAG, "CONTROL_MAX_REGIONS_AF is null; treating as zero-region device")
+        }
+        if (maxRegionsAeRaw == null) {
+            Log.w(TAG, "CONTROL_MAX_REGIONS_AE is null; treating as zero-region device")
+        }
+        val maxRegionsAf = maxRegionsAfRaw ?: 0
+        val maxRegionsAe = maxRegionsAeRaw ?: 0
+        val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+
         if (diagnosticsTracker != null) {
             diagnosticsTracker.physicalCameraIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 characteristics.physicalCameraIds.toList()
@@ -251,7 +277,68 @@ object SingleFrameCaptureController {
                     FocusLensDiagnosticsHelper.mapAfMode(it)
                 }
             diagnosticsTracker.selectedAfMode = FocusLensDiagnosticsHelper.mapAfMode(autoFocusMode)
+            diagnosticsTracker.focusTargetSource = "DEFAULT_CENTER"
+            diagnosticsTracker.normalizedTargetX = focusTarget.x
+            diagnosticsTracker.normalizedTargetY = focusTarget.y
+            diagnosticsTracker.normalizedAfSize = focusTarget.afSize
+            diagnosticsTracker.normalizedAeSize = focusTarget.aeSize
+            diagnosticsTracker.afMaxRegions = maxRegionsAf
+            diagnosticsTracker.aeMaxRegions = maxRegionsAe
         }
+
+        // Map normalized focus target to metering rectangles relative to active array.
+        // No crop region is queried here because no zoom control is active. When zoom
+        // is added, SCALER_CROP_REGION should be read from the device and passed to
+        // FocusMeteringCoordinateMapper.mapToActiveArray as the cropRegion parameter.
+        val pureActive = activeArray?.let {
+            PureRect(it.left, it.top, it.right, it.bottom)
+        }
+
+        val afRegionsToApply: Array<android.hardware.camera2.params.MeteringRectangle>? =
+            if (activeArray == null) {
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.afRegionApplied = "NONE_ACTIVE_ARRAY_NULL"
+                }
+                null
+            } else if (maxRegionsAf <= 0) {
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.afRegionApplied = "NONE_UNSUPPORTED"
+                }
+                null
+            } else {
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.afSize, pureActive!!)
+                val rect = android.hardware.camera2.params.MeteringRectangle(
+                    android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
+                    focusTarget.afWeight
+                )
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.afRegionApplied = "Rect(${mapped.left}, ${mapped.top}, ${mapped.right - mapped.left}x${mapped.bottom - mapped.top})"
+                }
+                arrayOf(rect)
+            }
+
+        val aeRegionsToApply: Array<android.hardware.camera2.params.MeteringRectangle>? =
+            if (activeArray == null) {
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.aeRegionApplied = "NONE_ACTIVE_ARRAY_NULL"
+                }
+                null
+            } else if (maxRegionsAe <= 0) {
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.aeRegionApplied = "NONE_UNSUPPORTED"
+                }
+                null
+            } else {
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.aeSize, pureActive!!)
+                val rect = android.hardware.camera2.params.MeteringRectangle(
+                    android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
+                    focusTarget.aeWeight
+                )
+                if (diagnosticsTracker != null) {
+                    diagnosticsTracker.aeRegionApplied = "Rect(${mapped.left}, ${mapped.top}, ${mapped.right - mapped.left}x${mapped.bottom - mapped.top})"
+                }
+                arrayOf(rect)
+            }
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
 
@@ -391,7 +478,9 @@ object SingleFrameCaptureController {
                 reader = reader,
                 handler = handler,
                 autoFocusMode = autoFocusMode,
-                diagnosticsTracker = diagnosticsTracker
+                diagnosticsTracker = diagnosticsTracker,
+                afRegions = afRegionsToApply,
+                aeRegions = aeRegionsToApply
             )
             if (warmupStart != null) {
                 tracker?.aeWarmupMs = (System.nanoTime() - warmupStart) / 1_000_000L
@@ -405,7 +494,9 @@ object SingleFrameCaptureController {
                 reader = reader,
                 handler = handler,
                 autoFocusMode = autoFocusMode,
-                diagnosticsTracker = diagnosticsTracker
+                diagnosticsTracker = diagnosticsTracker,
+                afRegions = afRegionsToApply,
+                aeRegions = aeRegionsToApply
             )
             if (afStart != null) {
                 tracker?.afWaitMs = (System.nanoTime() - afStart) / 1_000_000L
@@ -458,6 +549,8 @@ object SingleFrameCaptureController {
                     CaptureRequest.CONTROL_CAPTURE_INTENT,
                     CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE
                 )
+                afRegionsToApply?.let { builder.set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                aeRegionsToApply?.let { builder.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
 
                 val stillCallback = object : CameraCaptureSession.CaptureCallback() {
                     override fun onCaptureCompleted(
@@ -522,7 +615,9 @@ object SingleFrameCaptureController {
         reader: ImageReader,
         handler: Handler,
         autoFocusMode: Int?,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
+        afRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
+        aeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?
     ) {
         suspendCancellableCoroutine<Unit> { cont ->
             val isWarmupDone = AtomicBoolean(false)
@@ -564,6 +659,8 @@ object SingleFrameCaptureController {
                 addTarget(reader.surface)
                 autoFocusMode?.let { set(CaptureRequest.CONTROL_AF_MODE, it) }
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
             }
 
             val callback = object : CameraCaptureSession.CaptureCallback() {
@@ -628,7 +725,9 @@ object SingleFrameCaptureController {
         reader: ImageReader,
         handler: Handler,
         autoFocusMode: Int?,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null
+        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
+        afRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
+        aeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?
     ) {
         if (autoFocusMode == null) {
             Log.d(TAG, "Skipping AF lock because camera reports fixed-focus/no triggerable AF")
@@ -707,6 +806,8 @@ object SingleFrameCaptureController {
                     addTarget(reader.surface)
                     set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                    aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
                 }
                 session.setRepeatingRequest(repeatingRequest.build(), callback, handler)
 
@@ -716,6 +817,8 @@ object SingleFrameCaptureController {
                         set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
                         set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                        afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                        aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
                     }
                     session.capture(triggerRequest.build(), callback, handler)
                 }

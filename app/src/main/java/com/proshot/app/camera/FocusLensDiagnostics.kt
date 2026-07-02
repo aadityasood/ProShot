@@ -4,6 +4,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
+import java.util.Locale
 
 /**
  * Result of comparing the still capture metadata timestamp and the copied image buffer timestamp.
@@ -39,7 +40,16 @@ data class FocusLensDiagnostics(
     val copiedImageTimestamp: Long? = null,
     val captureWidth: Int? = null,
     val captureHeight: Int? = null,
-    val imageFormat: String? = null
+    val imageFormat: String? = null,
+    val focusTargetSource: String? = null,
+    val normalizedTargetX: Float? = null,
+    val normalizedTargetY: Float? = null,
+    val normalizedAfSize: Float? = null,
+    val normalizedAeSize: Float? = null,
+    val afMaxRegions: Int? = null,
+    val aeMaxRegions: Int? = null,
+    val afRegionApplied: String? = null,
+    val aeRegionApplied: String? = null
 ) {
     /**
      * Formats the diagnostics into a clean, monospace-friendly string for the debug HUD.
@@ -63,6 +73,16 @@ data class FocusLensDiagnostics(
         }
         availableAfModes?.let { if (it.isNotEmpty()) sb.append("  - Available AF: ${it.joinToString(", ")}\n") }
         selectedAfMode?.let { sb.append("  - Selected AF: $it\n") }
+        focusTargetSource?.let { sb.append("  - Focus Source: $it\n") }
+        if (normalizedTargetX != null && normalizedTargetY != null) {
+            sb.append("  - Normalized Target: (${normalizedTargetX}, ${normalizedTargetY})\n")
+        }
+        normalizedAfSize?.let { sb.append("  - Normalized AF Size: ${it.formatRegionSize()}\n") }
+        normalizedAeSize?.let { sb.append("  - Normalized AE Size: ${it.formatRegionSize()}\n") }
+        afMaxRegions?.let { sb.append("  - Max AF Regions: $it\n") }
+        aeMaxRegions?.let { sb.append("  - Max AE Regions: $it\n") }
+        afRegionApplied?.let { sb.append("  - AF Region: $it\n") }
+        aeRegionApplied?.let { sb.append("  - AE Region: $it\n") }
 
         aeWarmupExitState?.let { state ->
             val fc = aeWarmupFrameCount?.let { " ($it frames)" } ?: ""
@@ -91,6 +111,8 @@ data class FocusLensDiagnostics(
         return sb.toString().trimEnd()
     }
 }
+
+private fun Float.formatRegionSize(): String = String.format(Locale.US, "%.2f", this)
 
 /**
  * Pure helper utility to compare timestamps and map Camera2 constants.
@@ -233,6 +255,15 @@ class FocusLensDiagnosticsTracker {
     @Volatile var captureWidth: Int? = null
     @Volatile var captureHeight: Int? = null
     @Volatile var imageFormat: String? = null
+    @Volatile var focusTargetSource: String? = null
+    @Volatile var normalizedTargetX: Float? = null
+    @Volatile var normalizedTargetY: Float? = null
+    @Volatile var normalizedAfSize: Float? = null
+    @Volatile var normalizedAeSize: Float? = null
+    @Volatile var afMaxRegions: Int? = null
+    @Volatile var aeMaxRegions: Int? = null
+    @Volatile var afRegionApplied: String? = null
+    @Volatile var aeRegionApplied: String? = null
 
     /**
      * Creates an immutable [FocusLensDiagnostics] snapshot of the current tracked values.
@@ -257,7 +288,16 @@ class FocusLensDiagnosticsTracker {
             copiedImageTimestamp = copiedImageTimestamp,
             captureWidth = captureWidth,
             captureHeight = captureHeight,
-            imageFormat = imageFormat
+            imageFormat = imageFormat,
+            focusTargetSource = focusTargetSource,
+            normalizedTargetX = normalizedTargetX,
+            normalizedTargetY = normalizedTargetY,
+            normalizedAfSize = normalizedAfSize,
+            normalizedAeSize = normalizedAeSize,
+            afMaxRegions = afMaxRegions,
+            aeMaxRegions = aeMaxRegions,
+            afRegionApplied = afRegionApplied,
+            aeRegionApplied = aeRegionApplied
         )
     }
 }
