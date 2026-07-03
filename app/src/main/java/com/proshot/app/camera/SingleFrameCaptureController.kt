@@ -201,6 +201,24 @@ object SingleFrameCaptureController {
     }
 
     /**
+     * Returns the back camera's physical sensor orientation in degrees.
+     *
+     * Unlike [resolveOutputRotationDegrees], this value is constant for a given
+     * camera (it does not change with display rotation). It represents the
+     * clockwise angle by which the sensor is rotated relative to the device's
+     * natural (portrait) orientation. This is the correct input for mapping
+     * preview tap coordinates into sensor-normalized space via
+     * [PreviewTapFocusMapper].
+     */
+    fun resolveSensorOrientation(context: Context): Int {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: throw IllegalStateException("CameraManager is not available")
+        val cameraId = resolvePrimaryCameraId(manager)
+        return manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+    }
+
+    /**
      * Captures a single YUV_420_888 frame from the primary back camera and returns a safe heap-allocated [CopiedImageFrame].
      *
      * Ensures all native and physical resources (CameraDevice, CameraCaptureSession, ImageReader, HandlerThread)
@@ -277,7 +295,7 @@ object SingleFrameCaptureController {
                     FocusLensDiagnosticsHelper.mapAfMode(it)
                 }
             diagnosticsTracker.selectedAfMode = FocusLensDiagnosticsHelper.mapAfMode(autoFocusMode)
-            diagnosticsTracker.focusTargetSource = "DEFAULT_CENTER"
+            diagnosticsTracker.focusTargetSource = focusTarget.source.name
             diagnosticsTracker.normalizedTargetX = focusTarget.x
             diagnosticsTracker.normalizedTargetY = focusTarget.y
             diagnosticsTracker.normalizedAfSize = focusTarget.afSize

@@ -1,4 +1,4 @@
-﻿package com.proshot.app.camera
+package com.proshot.app.camera
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -19,6 +19,7 @@ class FocusMeteringTargetTest {
         assertEquals(0.10f, center.aeSize, 1e-5f)
         assertEquals(1000, center.afWeight)
         assertEquals(1000, center.aeWeight)
+        assertEquals(FocusTargetSource.DEFAULT_CENTER, center.source)
     }
 
     @Test
@@ -267,5 +268,55 @@ class FocusMeteringTargetTest {
         } catch (e: IllegalArgumentException) {
             // expected
         }
+    }
+
+    @Test
+    fun tap_preservesT11Defaults() {
+        val target = FocusMeteringTarget.tap(0.3f, 0.7f)
+        assertEquals(0.3f, target.x, 1e-5f)
+        assertEquals(0.7f, target.y, 1e-5f)
+        assertEquals(0.04f, target.afSize, 1e-5f)
+        assertEquals(0.10f, target.aeSize, 1e-5f)
+        assertEquals(1000, target.afWeight)
+        assertEquals(1000, target.aeWeight)
+        assertEquals(FocusTargetSource.USER_TAP, target.source)
+    }
+
+    @Test
+    fun mapToActiveArray_offCenterTapTarget_onRealisticSensorDimensions() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4056, bottom = 3040)
+        val target = FocusMeteringTarget.tap(0.25f, 0.75f)
+
+        val mappedAf = FocusMeteringCoordinateMapper.mapToActiveArray(target, target.afSize, activeArray)
+        // centerX = 0.25 * 4056 = 1014, centerY = 0.75 * 3040 = 2280
+        // regionWidth = max(0.04 * 4056, 1) = 162.24, halfWidth = 81.12
+        // regionHeight = max(0.04 * 3040, 1) = 121.6, halfHeight = 60.8
+        assertTrue(mappedAf.left < mappedAf.right)
+        assertTrue(mappedAf.top < mappedAf.bottom)
+        assertTrue(mappedAf.left in activeArray.left..activeArray.right)
+        assertTrue(mappedAf.right in activeArray.left..activeArray.right)
+        assertTrue(mappedAf.top in activeArray.top..activeArray.bottom)
+        assertTrue(mappedAf.bottom in activeArray.top..activeArray.bottom)
+
+        val mappedAe = FocusMeteringCoordinateMapper.mapToActiveArray(target, target.aeSize, activeArray)
+        assertTrue(mappedAe.left < mappedAe.right)
+        assertTrue(mappedAe.top < mappedAe.bottom)
+        // AF region should be contained within AE region for the same target
+        assertTrue(mappedAf.left >= mappedAe.left)
+        assertTrue(mappedAf.top >= mappedAe.top)
+        assertTrue(mappedAf.right <= mappedAe.right)
+        assertTrue(mappedAf.bottom <= mappedAe.bottom)
+    }
+
+    @Test
+    fun mapToActiveArray_floatMinValueSizeRemainsNonDegenerate() {
+        val target = FocusMeteringTarget.center()
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+
+        val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(target, Float.MIN_VALUE, activeArray)
+
+        // coerceAtLeast(1f) ensures minimum 1px width and height
+        assertTrue((mapped.right - mapped.left) >= 1)
+        assertTrue((mapped.bottom - mapped.top) >= 1)
     }
 }

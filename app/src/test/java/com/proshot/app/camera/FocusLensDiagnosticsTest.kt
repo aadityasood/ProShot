@@ -321,4 +321,13 @@ class FocusLensDiagnosticsTest {
         assertTrue(formatted.contains("AF Region: NONE_ACTIVE_ARRAY_NULL"))
         assertTrue(formatted.contains("AE Region: NONE_ACTIVE_ARRAY_NULL"))
     }
+
+    @Test
+    fun formatDiagnostics_showsUserTapFocusTargetSource() {
+        val model = FocusLensDiagnostics(
+            focusTargetSource = "USER_TAP"
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("Focus Source: USER_TAP"))
+    }
 }
