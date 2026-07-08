@@ -117,11 +117,19 @@ object FocusMeteringCoordinateMapper {
         val halfWidth = regionWidth / 2f
         val halfHeight = regionHeight / 2f
 
-        // Compute bounds and clamp to active array limits
-        val mappedLeft = (centerX - halfWidth).toInt().coerceIn(activeArray.left, activeArray.right)
-        val mappedTop = (centerY - halfHeight).toInt().coerceIn(activeArray.top, activeArray.bottom)
-        val mappedRight = (centerX + halfWidth).toInt().coerceIn(activeArray.left, activeArray.right)
-        val mappedBottom = (centerY + halfHeight).toInt().coerceIn(activeArray.top, activeArray.bottom)
+        // Clamp bounds to the crop region if provided, otherwise to the active array.
+        // This prevents metering regions from spilling into active-array pixels
+        // outside the visible capture crop (e.g., the top/bottom bars when a 16:9
+        // stream is center-cropped from a 4:3 sensor).
+        val clampLeft = refLeft
+        val clampTop = refTop
+        val clampRight = refRight
+        val clampBottom = refBottom
+
+        val mappedLeft = (centerX - halfWidth).toInt().coerceIn(clampLeft, clampRight)
+        val mappedTop = (centerY - halfHeight).toInt().coerceIn(clampTop, clampBottom)
+        val mappedRight = (centerX + halfWidth).toInt().coerceIn(clampLeft, clampRight)
+        val mappedBottom = (centerY + halfHeight).toInt().coerceIn(clampTop, clampBottom)
 
         // Ensure left <= right and top <= bottom
         val finalLeft = minOf(mappedLeft, mappedRight)
@@ -147,11 +155,15 @@ object PreviewTapFocusMapper {
      * using the sensor orientation degrees (constant for a given camera, independent of
      * display rotation).
      *
-     * This mapper assumes the preview view fully corresponds to the sensor active array
-     * (no letterboxing or pillarboxing). With `PreviewView.ScaleType.FILL_CENTER`, the
-     * visible preview may not fill the view on one axis. Tap coordinates from the
-     * cropped/padded edges will map to sensor locations outside the visible scene.
-     * Crop-aware mapping is deferred to a future task with zoom support.
+     * This mapper produces sensor-normalized [0, 1] coordinates which are then mapped into
+     * the capture-stream crop region by [FocusMeteringCoordinateMapper.mapToActiveArray].
+     * The downstream crop-aware mapper ensures metering rectangles land within the visible
+     * capture content, not in the non-visible edges of the full active array.
+     *
+     * **Known limitation:** The CameraX preview may show a different field of view than the
+     * Camera2 capture stream (e.g., 4:3 preview vs 16:9 capture). Taps in the preview area
+     * that falls outside the capture crop will clamp to the crop boundary. Aligning the
+     * CameraX preview aspect to the capture aspect is a future refinement.
      *
      * @param tapX The tapped X coordinate in view pixels.
      * @param tapY The tapped Y coordinate in view pixels.
@@ -186,5 +198,91 @@ object PreviewTapFocusMapper {
         }
 
         return FocusMeteringTarget.tap(sensorX, sensorY)
+    }
+}
+
+/**
+ * Pure Kotlin utility for calculating the center-cropped region of a sensor's active pixel array
+ * that matches the aspect ratio of a given stream configuration.
+ */
+object ActiveArrayCropCalculator {
+    /**
+     * Calculates the center-cropped region of the active array matching the stream aspect ratio.
+     *
+     * The active array is expected in landscape orientation (width >= height), which is the
+     * standard format for `CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE`. Stream
+     * dimensions in either portrait or landscape orientation are normalized before comparison.
+     *
+     * The computed crop is a software-level center crop that identifies where the visible
+     * content of the selected Camera2 YUV stream sits within the full active array. This is
+     * the correct reference for metering rectangle placement: a sensor-normalized tap at
+     * (0.5, 0.5) should meter the center of the visible capture content, not the center of
+     * the full active array.
+     *
+     * **Known limitation:** The CameraX preview stream may use a different aspect ratio or
+     * resolution than the selected Camera2 capture stream (CameraX defaults to 4:3 when
+     * `setTargetAspectRatio` is not set). If the preview and capture aspects differ, the
+     * user sees a 4:3 preview but captures a 16:9 frame. Tap coordinates are mapped relative
+     * to the capture crop, not the preview crop. For taps near the top/bottom edges of a
+     * 4:3 preview, the metering target will clamp to the 16:9 capture boundary. Aligning
+     * the CameraX preview aspect to the capture aspect is a future refinement.
+     *
+     * @param activeArray The active pixel array size of the sensor (landscape: width >= height).
+     * @param streamSize The selected stream size (capture or preview).
+     * @return A [PureRect] representing the crop bounds relative to the active array coordinates.
+     */
+    fun calculateCenterCrop(activeArray: PureRect, streamSize: CaptureSize): PureRect {
+        require(streamSize.width > 0) { "stream width must be positive: ${streamSize.width}" }
+        require(streamSize.height > 0) { "stream height must be positive: ${streamSize.height}" }
+        val arrayWidth = activeArray.right - activeArray.left
+        val arrayHeight = activeArray.bottom - activeArray.top
+        require(arrayWidth > 0) { "activeArray width must be positive: $arrayWidth" }
+        require(arrayHeight > 0) { "activeArray height must be positive: $arrayHeight" }
+
+        // Normalize orientations before computing aspect ratio
+        val isArrayLandscape = arrayWidth >= arrayHeight
+        val isStreamLandscape = streamSize.width >= streamSize.height
+
+        val normWidth = if (isArrayLandscape == isStreamLandscape) streamSize.width else streamSize.height
+        val normHeight = if (isArrayLandscape == isStreamLandscape) streamSize.height else streamSize.width
+
+        val arrayAspect = arrayWidth.toDouble() / arrayHeight
+        val streamAspect = normWidth.toDouble() / normHeight
+
+        val cropLeft: Int
+        val cropTop: Int
+        val cropRight: Int
+        val cropBottom: Int
+
+        if (streamAspect > arrayAspect) {
+            // Stream is wider than active array: height is cropped
+            val croppedHeight = (arrayWidth / streamAspect).toInt()
+            val verticalMargin = (arrayHeight - croppedHeight) / 2
+            cropLeft = activeArray.left
+            cropTop = activeArray.top + verticalMargin
+            cropRight = activeArray.right
+            cropBottom = cropTop + croppedHeight
+        } else if (streamAspect < arrayAspect) {
+            // Stream is narrower than active array: width is cropped
+            val croppedWidth = (arrayHeight * streamAspect).toInt()
+            val horizontalMargin = (arrayWidth - croppedWidth) / 2
+            cropLeft = activeArray.left + horizontalMargin
+            cropTop = activeArray.top
+            cropRight = cropLeft + croppedWidth
+            cropBottom = activeArray.bottom
+        } else {
+            // Aspects match exactly
+            cropLeft = activeArray.left
+            cropTop = activeArray.top
+            cropRight = activeArray.right
+            cropBottom = activeArray.bottom
+        }
+
+        return PureRect(
+            left = cropLeft,
+            top = cropTop,
+            right = cropRight,
+            bottom = cropBottom
+        )
     }
 }

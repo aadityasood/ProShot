@@ -49,7 +49,8 @@ data class FocusLensDiagnostics(
     val afMaxRegions: Int? = null,
     val aeMaxRegions: Int? = null,
     val afRegionApplied: String? = null,
-    val aeRegionApplied: String? = null
+    val aeRegionApplied: String? = null,
+    val meteringCropRegion: String? = null
 ) {
     /**
      * Formats the diagnostics into a clean, monospace-friendly string for the debug HUD.
@@ -83,6 +84,7 @@ data class FocusLensDiagnostics(
         aeMaxRegions?.let { sb.append("  - Max AE Regions: $it\n") }
         afRegionApplied?.let { sb.append("  - AF Region: $it\n") }
         aeRegionApplied?.let { sb.append("  - AE Region: $it\n") }
+        meteringCropRegion?.let { sb.append("  - Metering Crop: $it\n") }
 
         aeWarmupExitState?.let { state ->
             val fc = aeWarmupFrameCount?.let { " ($it frames)" } ?: ""
@@ -264,6 +266,7 @@ class FocusLensDiagnosticsTracker {
     @Volatile var aeMaxRegions: Int? = null
     @Volatile var afRegionApplied: String? = null
     @Volatile var aeRegionApplied: String? = null
+    @Volatile var meteringCropRegion: String? = null
 
     /**
      * Creates an immutable [FocusLensDiagnostics] snapshot of the current tracked values.
@@ -297,7 +300,8 @@ class FocusLensDiagnosticsTracker {
             afMaxRegions = afMaxRegions,
             aeMaxRegions = aeMaxRegions,
             afRegionApplied = afRegionApplied,
-            aeRegionApplied = aeRegionApplied
+            aeRegionApplied = aeRegionApplied,
+            meteringCropRegion = meteringCropRegion
         )
     }
 }

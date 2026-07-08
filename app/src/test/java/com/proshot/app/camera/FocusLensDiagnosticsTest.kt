@@ -275,7 +275,8 @@ class FocusLensDiagnosticsTest {
             afMaxRegions = 1,
             aeMaxRegions = 1,
             afRegionApplied = "Rect(1920, 1440, 160x120)",
-            aeRegionApplied = "Rect(1800, 1350, 400x300)"
+            aeRegionApplied = "Rect(1800, 1350, 400x300)",
+            meteringCropRegion = "Rect(0, 375, 4000x2250)"
         )
         val formatted = model.formatDiagnostics()
         assertTrue(formatted.contains("Focus Source: DEFAULT_CENTER"))
@@ -286,6 +287,7 @@ class FocusLensDiagnosticsTest {
         assertTrue(formatted.contains("Max AE Regions: 1"))
         assertTrue(formatted.contains("AF Region: Rect(1920, 1440, 160x120)"))
         assertTrue(formatted.contains("AE Region: Rect(1800, 1350, 400x300)"))
+        assertTrue(formatted.contains("Metering Crop: Rect(0, 375, 4000x2250)"))
     }
 
     @Test

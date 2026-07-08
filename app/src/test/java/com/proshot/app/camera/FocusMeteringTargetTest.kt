@@ -319,4 +319,192 @@ class FocusMeteringTargetTest {
         assertTrue((mapped.right - mapped.left) >= 1)
         assertTrue((mapped.bottom - mapped.top) >= 1)
     }
+
+    @Test
+    fun calculateCenterCrop_4to3ActiveArrayTo16to9Stream_cropsHeight() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        val stream = CaptureSize(width = 1920, height = 1080)
+        val crop = ActiveArrayCropCalculator.calculateCenterCrop(activeArray, stream)
+        assertEquals(0, crop.left)
+        assertEquals(375, crop.top)
+        assertEquals(4000, crop.right)
+        assertEquals(2625, crop.bottom)
+    }
+
+    @Test
+    fun calculateCenterCrop_matchingAspect_returnsFullActiveArray() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        val stream = CaptureSize(width = 800, height = 600)
+        val crop = ActiveArrayCropCalculator.calculateCenterCrop(activeArray, stream)
+        assertEquals(activeArray.left, crop.left)
+        assertEquals(activeArray.top, crop.top)
+        assertEquals(activeArray.right, crop.right)
+        assertEquals(activeArray.bottom, crop.bottom)
+    }
+
+    @Test
+    fun calculateCenterCrop_portraitAndLandscapeInputs_handledDeterministically() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+
+        // Portrait stream size: 1080x1920 (aspect 9:16)
+        // Should align orientations and yield the same 16:9 crop bounds
+        val streamPortrait = CaptureSize(width = 1080, height = 1920)
+        val cropPortrait = ActiveArrayCropCalculator.calculateCenterCrop(activeArray, streamPortrait)
+        assertEquals(0, cropPortrait.left)
+        assertEquals(375, cropPortrait.top)
+        assertEquals(4000, cropPortrait.right)
+        assertEquals(2625, cropPortrait.bottom)
+    }
+
+    @Test
+    fun calculateCenterCrop_invalidStreamSizes_throwIllegalArgumentException() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        try {
+            ActiveArrayCropCalculator.calculateCenterCrop(activeArray, CaptureSize(0, 1080))
+            fail("Should throw on zero width")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+
+        try {
+            ActiveArrayCropCalculator.calculateCenterCrop(activeArray, CaptureSize(1920, -100))
+            fail("Should throw on negative height")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+    }
+
+    @Test
+    fun mapToActiveArray_offCenterTapWithCropRegion() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        val cropRegion = PureRect(left = 0, top = 375, right = 4000, bottom = 2625) // 16:9 center crop of 4:3
+
+        // Tapped off-center (e.g. top-left relative to preview: x = 0.25f, y = 0.25f)
+        val target = FocusMeteringTarget(x = 0.25f, y = 0.25f, source = FocusTargetSource.USER_TAP)
+
+        // AF Region Mapping (size = 0.04f)
+        val mappedAf = FocusMeteringCoordinateMapper.mapToActiveArray(target, target.afSize, activeArray, cropRegion)
+
+        // Crop width = 4000, crop height = 2250
+        // Center X = 0 + 0.25 * 4000 = 1000
+        // Center Y = 375 + 0.25 * 2250 = 375 + 562.5 = 937
+        // Half-width relative to crop = (0.04 * 4000) / 2 = 80
+        // Half-height relative to crop = (0.04 * 2250) / 2 = 45
+        // Expected Left = 1000 - 80 = 920
+        // Expected Right = 1000 + 80 = 1080
+        // Expected Top = 937 - 45 = 892
+        // Expected Bottom = 937 + 45 = 982
+        assertEquals(920, mappedAf.left)
+        assertEquals(1080, mappedAf.right)
+        assertEquals(892, mappedAf.top)
+        assertEquals(982, mappedAf.bottom)
+    }
+
+    @Test
+    fun calculateCenterCrop_nonZeroOriginActiveArray_offsetsCorrectly() {
+        // Approximate Nothing Phone 2 active array with non-zero top offset
+        val activeArray = PureRect(left = 0, top = 8, right = 4080, bottom = 3072)
+        val stream = CaptureSize(width = 1920, height = 1080)
+        val crop = ActiveArrayCropCalculator.calculateCenterCrop(activeArray, stream)
+
+        // Verify crop is within active array bounds
+        assertTrue(crop.left >= activeArray.left)
+        assertTrue(crop.top >= activeArray.top)
+        assertTrue(crop.right <= activeArray.right)
+        assertTrue(crop.bottom <= activeArray.bottom)
+
+        // Verify it is centered (margins differ by at most 1px from integer rounding)
+        val topMargin = crop.top - activeArray.top
+        val bottomMargin = activeArray.bottom - crop.bottom
+        assertTrue(
+            "Top ($topMargin) and bottom ($bottomMargin) margins should differ by at most 1px",
+            Math.abs(topMargin - bottomMargin) <= 1
+        )
+
+        // Verify aspect ratio matches 16:9 within integer tolerance
+        val cropAspect = (crop.right - crop.left).toDouble() / (crop.bottom - crop.top)
+        assertEquals(1920.0 / 1080.0, cropAspect, 0.01)
+    }
+
+    @Test
+    fun calculateCenterCrop_widerActiveArrayThanStream_cropsWidth() {
+        // 2:1 aspect array (hypothetical ultra-wide sensor), 4:3 stream
+        val activeArray = PureRect(left = 0, top = 0, right = 6000, bottom = 3000)
+        val stream = CaptureSize(width = 1600, height = 1200) // 4:3 stream
+        val crop = ActiveArrayCropCalculator.calculateCenterCrop(activeArray, stream)
+
+        // streamAspect = 1.333, arrayAspect = 2.0 -> streamAspect < arrayAspect -> crops width
+        assertEquals(activeArray.top, crop.top)
+        assertEquals(activeArray.bottom, crop.bottom)
+        assertTrue(crop.left > activeArray.left)
+        assertTrue(crop.right < activeArray.right)
+
+        // Centered horizontally
+        val leftMargin = crop.left - activeArray.left
+        val rightMargin = activeArray.right - crop.right
+        assertTrue(
+            "Left ($leftMargin) and right ($rightMargin) margins should differ by at most 1px",
+            Math.abs(leftMargin - rightMargin) <= 1
+        )
+
+        // Verify crop aspect matches stream
+        val cropAspect = (crop.right - crop.left).toDouble() / (crop.bottom - crop.top)
+        assertEquals(1600.0 / 1200.0, cropAspect, 0.01)
+    }
+
+    @Test
+    fun mapToActiveArray_edgeTapStaysInsideCropRegion() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        val cropRegion = PureRect(left = 0, top = 375, right = 4000, bottom = 2625) // 16:9 crop
+
+        // Tap at sensor y=0 (top of visible content) — without crop clamping,
+        // the AF rectangle would extend above the crop into the non-visible area.
+        val topEdgeTarget = FocusMeteringTarget.tap(0.5f, 0.0f)
+        val mappedTop = FocusMeteringCoordinateMapper.mapToActiveArray(
+            topEdgeTarget, topEdgeTarget.afSize, activeArray, cropRegion
+        )
+        assertTrue("AF top must stay inside crop", mappedTop.top >= cropRegion.top)
+        assertTrue("AF bottom must stay inside crop", mappedTop.bottom <= cropRegion.bottom)
+
+        // Tap at sensor y=1 (bottom of visible content) — without crop clamping,
+        // the AF rectangle would extend below the crop.
+        val bottomEdgeTarget = FocusMeteringTarget.tap(0.5f, 1.0f)
+        val mappedBottom = FocusMeteringCoordinateMapper.mapToActiveArray(
+            bottomEdgeTarget, bottomEdgeTarget.afSize, activeArray, cropRegion
+        )
+        assertTrue("AF top must stay inside crop", mappedBottom.top >= cropRegion.top)
+        assertTrue("AF bottom must stay inside crop", mappedBottom.bottom <= cropRegion.bottom)
+
+        // Verify AE regions (larger) also stay inside crop at edges
+        val mappedAeTop = FocusMeteringCoordinateMapper.mapToActiveArray(
+            topEdgeTarget, topEdgeTarget.aeSize, activeArray, cropRegion
+        )
+        assertTrue("AE top must stay inside crop", mappedAeTop.top >= cropRegion.top)
+        assertTrue("AE bottom must stay inside crop", mappedAeTop.bottom <= cropRegion.bottom)
+    }
+
+    @Test
+    fun mapToActiveArray_cropAwareMappingDiffersFromNoCropForEdgeTap() {
+        val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
+        val cropRegion = PureRect(left = 0, top = 375, right = 4000, bottom = 2625)
+
+        // Sensor y=0.0 maps to top of reference region.
+        // Without crop: centerY = 0.0 * 3000 = 0 (full array top)
+        // With crop: centerY = 375 + 0.0 * 2250 = 375 (crop top)
+        val target = FocusMeteringTarget.tap(0.5f, 0.0f)
+
+        val noCrop = FocusMeteringCoordinateMapper.mapToActiveArray(
+            target, target.afSize, activeArray
+        )
+        val withCrop = FocusMeteringCoordinateMapper.mapToActiveArray(
+            target, target.afSize, activeArray, cropRegion
+        )
+
+        // The crop-aware mapping should place the metering region lower (at crop top)
+        // than the no-crop mapping (at active array top).
+        assertTrue(
+            "Crop-aware top (${withCrop.top}) must be greater than no-crop top (${noCrop.top})",
+            withCrop.top > noCrop.top
+        )
+    }
 }

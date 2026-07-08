@@ -304,12 +304,34 @@ object SingleFrameCaptureController {
             diagnosticsTracker.aeMaxRegions = maxRegionsAe
         }
 
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+
+        // Match the closest supported size to 1080p for single-frame stability.
+        val mappedSizes = yuvSizes.map { CaptureSize(it.width, it.height) }
+        val matchedSize = findClosestStableSize(mappedSizes)
+        val targetSize = Size(matchedSize.width, matchedSize.height)
+
         // Map normalized focus target to metering rectangles relative to active array.
-        // No crop region is queried here because no zoom control is active. When zoom
-        // is added, SCALER_CROP_REGION should be read from the device and passed to
-        // FocusMeteringCoordinateMapper.mapToActiveArray as the cropRegion parameter.
         val pureActive = activeArray?.let {
             PureRect(it.left, it.top, it.right, it.bottom)
+        }
+
+        val cropRegion = if (pureActive != null) {
+            ActiveArrayCropCalculator.calculateCenterCrop(pureActive, matchedSize)
+        } else {
+            null
+        }
+
+        if (diagnosticsTracker != null) {
+            diagnosticsTracker.meteringCropRegion = if (cropRegion != null) {
+                "Rect(${cropRegion.left}, ${cropRegion.top}, ${cropRegion.right - cropRegion.left}x${cropRegion.bottom - cropRegion.top})"
+            } else {
+                // "NONE" is currently unreachable: cropRegion is non-null whenever
+                // pureActive is non-null (see calculateCenterCrop call above).
+                // Retained for defensive coverage if crop logic changes.
+                if (activeArray == null) "NONE_ACTIVE_ARRAY_NULL" else "NONE"
+            }
         }
 
         val afRegionsToApply: Array<android.hardware.camera2.params.MeteringRectangle>? =
@@ -324,7 +346,12 @@ object SingleFrameCaptureController {
                 }
                 null
             } else {
-                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.afSize, pureActive!!)
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(
+                    target = focusTarget,
+                    size = focusTarget.afSize,
+                    activeArray = pureActive!!,
+                    cropRegion = cropRegion
+                )
                 val rect = android.hardware.camera2.params.MeteringRectangle(
                     android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
                     focusTarget.afWeight
@@ -347,7 +374,12 @@ object SingleFrameCaptureController {
                 }
                 null
             } else {
-                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.aeSize, pureActive!!)
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(
+                    target = focusTarget,
+                    size = focusTarget.aeSize,
+                    activeArray = pureActive!!,
+                    cropRegion = cropRegion
+                )
                 val rect = android.hardware.camera2.params.MeteringRectangle(
                     android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
                     focusTarget.aeWeight
@@ -357,13 +389,6 @@ object SingleFrameCaptureController {
                 }
                 arrayOf(rect)
             }
-        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
-
-        // Match the closest supported size to 1080p for single-frame stability.
-        val mappedSizes = yuvSizes.map { CaptureSize(it.width, it.height) }
-        val matchedSize = findClosestStableSize(mappedSizes)
-        val targetSize = Size(matchedSize.width, matchedSize.height)
 
         Log.d(TAG, "Selected YUV_420_888 target capture size: ${targetSize.width}x${targetSize.height}")
 

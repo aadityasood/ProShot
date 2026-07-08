@@ -388,14 +388,14 @@ private fun ActivePreviewContent(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(isCapturing, previewView.width, previewView.height) {
+                .pointerInput(isCapturing) {
                     detectTapGestures { offset ->
-                        if (!isCapturing && previewView.width > 0 && previewView.height > 0) {
+                        if (!isCapturing && size.width > 0 && size.height > 0) {
                             val target = PreviewTapFocusMapper.mapToSensorTarget(
                                 tapX = offset.x,
                                 tapY = offset.y,
-                                viewWidth = previewView.width,
-                                viewHeight = previewView.height,
+                                viewWidth = size.width,
+                                viewHeight = size.height,
                                 rotationDegrees = sensorOrientationDegrees
                             )
                             tapCounter++
