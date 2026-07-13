@@ -108,7 +108,35 @@ enhancements with the ProShot Natural color profile.
 > To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds. AE warm-up and AF wait latencies are measured sequentially in separate pre-capture phases to maximize focus and exposure reliability.
 
 > **Pre-Capture AF/AE Policy:**
-> Pre-capture is executed in sequential phases: a bounded AE warm-up phase (gate min 3, max 12 frames), followed by a bounded AF wait/lock phase (max 30 frames). Focus-readiness rules ensure that: (1) null AF state is never accepted as ready in active AF modes (AUTO, CONTINUOUS_PICTURE); this prevents premature exit on Qualcomm HALs where null appears during trigger processing; (2) AUTO mode uses `AF_TRIGGER_MIN_FRAMES=2` to guard against pre-trigger pipeline-depth results, accepting only `FOCUSED_LOCKED`; (3) CONTINUOUS_PICTURE mode uses a separate `AF_PASSIVE_MIN_FRAMES=8` gate (~267 ms at 30 fps) to prevent accepting stale `PASSIVE_FOCUSED` state carried from a prior CameraX session's lens position, then accepts `FOCUSED_LOCKED` or `PASSIVE_FOCUSED`; (4) fixed-focus cameras skip the AF wait completely; (5) unknown active AF modes fail closed and wait for the bounded frame cap rather than silently accepting unfocused output. Under the T11.2 strategy, the still-capture controller experimentally prefers `CONTROL_AF_MODE_CONTINUOUS_PICTURE` over `CONTROL_AF_MODE_AUTO` when both are available, using `CONTROL_AF_MODE_AUTO` as a fallback. Explicit trigger starts (`AF_TRIGGER_START`) are only sent for `AUTO` mode. Focus targeting regions are mapped from normalized point coordinates (defaulting to center `(0.5, 0.5)`) using a tighter autofocus size (`0.04f`) and a broader autoexposure size (`0.10f`) relative to the active array, mapped using `FocusMeteringCoordinateMapper` (with `require(size > 0f)` and `coerceAtLeast(1f)` safety guards) and applied as `CONTROL_AF_REGIONS` and `CONTROL_AE_REGIONS` across pre-capture and still-capture requests when supported. Under the T12 tap-to-focus foundation, optional user tap coordinates are captured on a transparent Compose overlay above the preview, mapped from view pixels to sensor-normalized coordinates using `PreviewTapFocusMapper` with the camera's physical `SENSOR_ORIENTATION` (resolved once at composable setup via `resolveSensorOrientation`, not per-tap, ensuring tap mapping is synchronous and immune to double-tap race conditions), stored in Compose state with a `USER_TAP` source, and passed to the capture coordinator. A temporary circular focus ring is displayed at the tapped coordinates for 1.5 seconds. Under the T12.1 tap-to-focus coordinate mapping correction, active array mapping is made crop-aware by computing the center-crop region matching the selected YUV stream aspect ratio using `ActiveArrayCropCalculator` and passing it to the coordinate mapper, ensuring that tapped coordinates correctly target the corresponding physical scene area on sensors whose active array aspect ratio differs from the stream aspect ratio. Metering rectangles are clamped to the crop region bounds (not just the full active array), preventing AF/AE from spilling into non-visible sensor content at crop boundaries. The CameraX preview may show a different aspect ratio than the Camera2 capture stream (CameraX defaults to 4:3); taps in the preview area that fall outside the capture crop clamp to the crop boundary. Aligning the CameraX preview aspect to the capture aspect is a documented future refinement.
+> Pre-capture runs sequentially: bounded AE warm-up (minimum 3, maximum 12
+> repeating results), bounded AF wait/lock (maximum 30 qualifying repeating
+> results), then still capture. Default-center capture prefers
+> `CONTROL_AF_MODE_CONTINUOUS_PICTURE` and falls back to
+> `CONTROL_AF_MODE_AUTO`. A user tap with a mappable AF region prefers `AUTO`
+> and falls back to continuous-picture mode only when `AUTO` is unavailable.
+> If AF regions are unsupported or active-array metadata is unavailable, the
+> requested tap is reported with an explicit fallback and AF uses the safe
+> default-center strategy; a supported tapped AE region remains independent.
+>
+> `AUTO` submits exactly one `CONTROL_AF_TRIGGER_START` request. Its dedicated
+> callback must report successful completion before repeating results can count
+> toward readiness. The controller then requires two subsequent repeating
+> results and accepts only `FOCUSED_LOCKED`; stale results queued before the
+> trigger boundary are ignored. Trigger submission failure, capture failure, or
+> sequence abort ends the capture as a failure. Continuous-picture mode sends no
+> AF trigger, requires eight repeating results, and then accepts
+> `FOCUSED_LOCKED` or `PASSIVE_FOCUSED`. Null AF states and unknown active modes
+> fail closed, while fixed-focus cameras skip the AF wait.
+>
+> Focus targets use normalized coordinates with AF size `0.04f`, AE size
+> `0.10f`, and weight `1000`. `PreviewTapFocusMapper` accounts for sensor
+> orientation, and `ActiveArrayCropCalculator` maps rectangles into the selected
+> YUV stream crop. Rectangles clamp to crop bounds. AF outcome diagnostics latch
+> one immutable sample from the result or failure that ended the wait, including
+> request provenance, so later callbacks cannot replace the displayed outcome.
+> The CameraX preview may use a different aspect ratio than the Camera2 capture
+> stream; taps outside the capture crop clamp to its boundary. Matching those
+> preview and capture aspects remains a future refinement.
 
 > **Focus/Lens Diagnostics:**
 > Focus/lens diagnostics are debug-only evidence used to analyze physical lens limits, hardware levels, available focal lengths, timestamp correlation, and AE/AF pre-capture outcomes for a still capture. This data helps diagnose close-subject focus issues without changing active capture policies.

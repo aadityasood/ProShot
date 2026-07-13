@@ -332,4 +332,107 @@ class FocusLensDiagnosticsTest {
         val formatted = model.formatDiagnostics()
         assertTrue(formatted.contains("Focus Source: USER_TAP"))
     }
+
+    @Test
+    fun focusTargetSource_userTapNameRemainsStable() {
+        assertEquals("USER_TAP", FocusTargetSource.USER_TAP.name)
+    }
+
+    @Test
+    fun formatDiagnostics_showsRequestedAndEffectiveFocusFallback() {
+        val model = FocusLensDiagnostics(
+            focusTargetSource = "USER_TAP",
+            effectiveFocusTargetSource = "DEFAULT_CENTER",
+            focusTargetFallback = "AF_REGIONS_UNSUPPORTED"
+        )
+        val formatted = model.formatDiagnostics()
+
+        assertTrue(formatted.contains("Requested Focus Source: USER_TAP"))
+        assertTrue(formatted.contains("Effective Focus Source: DEFAULT_CENTER"))
+        assertTrue(formatted.contains("Focus Fallback: AF_REGIONS_UNSUPPORTED"))
+    }
+
+    @Test
+    fun formatDiagnostics_showsNewResultSideDiagnosticsWhenPresent() {
+        val model = FocusLensDiagnostics(
+            resultAfMode = "AUTO",
+            resultAfRegions = "Rect(0, 375, 160x120 wt=1000)",
+            resultAeRegions = "Rect(0, 375, 400x300 wt=1000)",
+            resultScalerCrop = "Rect(0, 0, 4000x3000)",
+            afTriggerIssued = true,
+            afResultRequestProvenance = "REPEATING"
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("Result AF Mode: AUTO"))
+        assertTrue(formatted.contains("Result AF Regions: Rect(0, 375, 160x120 wt=1000)"))
+        assertTrue(formatted.contains("Result AE Regions: Rect(0, 375, 400x300 wt=1000)"))
+        assertTrue(formatted.contains("Result Crop: Rect(0, 0, 4000x3000)"))
+        assertTrue(formatted.contains("AF Trigger Issued: true"))
+        assertTrue(formatted.contains("AF Result Request: REPEATING"))
+    }
+
+    @Test
+    fun formatDiagnostics_showsUnavailableWhenResultSideFieldsAreNull() {
+        val model = FocusLensDiagnostics(
+            resultAfMode = null,
+            resultAfRegions = null,
+            resultAeRegions = null,
+            resultScalerCrop = null,
+            afTriggerIssued = null
+        )
+        val formatted = model.formatDiagnostics()
+        assertTrue(formatted.contains("Result AF Mode: UNAVAILABLE"))
+        assertTrue(formatted.contains("Result AF Regions: UNAVAILABLE"))
+        assertTrue(formatted.contains("Result AE Regions: UNAVAILABLE"))
+        assertTrue(formatted.contains("Result Crop: UNAVAILABLE"))
+        assertTrue(formatted.contains("AF Trigger Issued: UNAVAILABLE"))
+        assertTrue(formatted.contains("AF Result Request: UNAVAILABLE"))
+    }
+
+    @Test
+    fun formatDiagnostics_showsUnavailableStateForTriggerFailureWithoutResult() {
+        val model = FocusLensDiagnostics(
+            afWaitExitReason = "TRIGGER_FAILED",
+            afWaitFrameCount = 0,
+            afTriggerIssued = true,
+            afResultRequestProvenance = "TRIGGER"
+        )
+        val formatted = model.formatDiagnostics()
+
+        assertTrue(formatted.contains("AF Lock: TRIGGER_FAILED State: UNAVAILABLE (0 frames)"))
+        assertTrue(formatted.contains("Result AF Mode: UNAVAILABLE"))
+        assertTrue(formatted.contains("AF Result Request: TRIGGER"))
+    }
+
+    @Test
+    fun snapshot_latchesFirstOutcomeAndRejectsLaterCallbackSample() {
+        val tracker = FocusLensDiagnosticsTracker()
+        val terminalSample = FocusWaitDiagnosticSample(
+            resultAfMode = "AUTO",
+            resultAfRegions = "Rect(10, 20, 30x40 wt=1000)",
+            resultAeRegions = "Rect(0, 0, 100x100 wt=1000)",
+            resultScalerCrop = "Rect(0, 0, 4000x3000)",
+            afState = "FOCUSED_LOCKED",
+            repeatingFrameCount = 2,
+            exitReason = "FOCUSED",
+            afTriggerIssued = true,
+            requestProvenance = "REPEATING"
+        )
+        val lateSample = terminalSample.copy(
+            resultAfMode = "CONTINUOUS_PICTURE",
+            afState = "PASSIVE_UNFOCUSED",
+            repeatingFrameCount = 3,
+            exitReason = "FRAME_CAP_TIMEOUT"
+        )
+
+        assertTrue(tracker.publishAfWaitOutcome(terminalSample))
+        assertFalse(tracker.publishAfWaitOutcome(lateSample))
+        val snapshot = tracker.snapshot()
+
+        assertEquals("AUTO", snapshot.resultAfMode)
+        assertEquals("FOCUSED_LOCKED", snapshot.afWaitExitState)
+        assertEquals(2, snapshot.afWaitFrameCount)
+        assertEquals("FOCUSED", snapshot.afWaitExitReason)
+        assertEquals("REPEATING", snapshot.afResultRequestProvenance)
+    }
 }
