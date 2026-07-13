@@ -1,265 +1,265 @@
-# ProShot — System Architecture
+# ProShot System Architecture
 
-## Overview
+## Purpose
 
-ProShot provides a reference-grade computational photography pipeline on
-Android. The app captures multi-frame bursts, aligns and merges them for
-HDR/noise reduction, performs semantic scene analysis, and applies per-region
-enhancements with the ProShot Natural color profile.
+This document describes the repository as it exists today and separates that
+runtime architecture from configured dependencies, approved future work, and
+research.
 
-## Pipeline Architecture
+Status vocabulary:
 
-```
-┌─────────────────────────────────────────────────────┐
-│              LAYER 1: CAPTURE                        │
-│  Camera2 API (Kotlin)                                │
-│  • Burst capture: 5 frames, bracketed exposure       │
-│  • Frame buffering (ring buffer of recent frames)    │
-│  • Sharpness-based reference frame selection         │
-│  • RAW (DNG) capture when available, YUV fallback    │
-│  Input: scene    Output: List<ImageFrame>             │
-└──────────────────────┬──────────────────────────────┘
-                       ↓
-┌─────────────────────────────────────────────────────┐
-│              LAYER 2: ALIGNMENT & MERGING            │
-│  OpenCV + Custom C++ (NDK)                           │
-│  • Gaussian pyramid (4 levels) for coarse-to-fine    │
-│  • Tile-based motion estimation (16x16 → 8x8 tiles) │
-│  • Sub-pixel alignment via L2 distance matching      │
-│  • Adaptive temporal merging with ghost rejection    │
-│  Input: List<ImageFrame>  Output: MergedHDRImage     │
-└──────────────────────┬──────────────────────────────┘
-                       ↓
-┌─────────────────────────────────────────────────────┐
-│              LAYER 3: SEMANTIC ANALYSIS              │
-│  MediaPipe + TFLite (Kotlin + GPU Delegate)          │
-│  • Face detection: BlazeFace (<1ms)                  │
-│  • Face landmarks: 478-point 3D mesh (~5ms)          │
-│  • Skin mask: polygon from face landmark subset      │
-│  • Person segmentation: selfie seg model (~8ms)      │
-│  • Scene classification: MobileNetV3 (~15ms)         │
-│  Input: MergedHDRImage  Output: SemanticMasks        │
-└──────────────────────┬──────────────────────────────┘
-                       ↓
-┌─────────────────────────────────────────────────────┐
-│              LAYER 4: ENHANCEMENT                    │
-│  GPU Compute (AGSL / OpenGL ES 3.1)                  │
-│  • Per-region tone mapping (face, sky, background)   │
-│  • Skin-aware noise reduction                        │
-│     - Bilateral filter on skin (sigma_c=50, σ_s=15)  │
-│     - Non-local means on non-skin (h=10)             │
-│  • Face exposure optimization (target: 55-65% lum)   │
-│  • Shadow fill on faces (+20-30% lift, +3K warmth)   │
-│  • Adaptive sharpening (0 on skin, moderate elsewhere)│
-│  Input: MergedHDRImage + SemanticMasks               │
-│  Output: EnhancedImage                               │
-└──────────────────────┬──────────────────────────────┘
-                       ↓
-┌─────────────────────────────────────────────────────┐
-│              LAYER 5: COLOR SCIENCE                   │
-│  Custom Processing (GPU)                              │
-│  • ProShot Natural tone curve (gentle S-curve)       │
-│     Blacks: +5, Shadows: +8%, Highlights: -5%        │
-│  • Color temperature: +3-5K global, +8-10K skin      │
-│  • Saturation: -5% overall, -10% skin, +15% sky     │
-│  • Skin tone protection (hue-locked in HSL)          │
-│  • Per-region color adjustment using semantic masks   │
-│  Input: EnhancedImage + SemanticMasks                │
-│  Output: FinalImage                                  │
-└──────────────────────┬──────────────────────────────┘
-                       ↓
-┌─────────────────────────────────────────────────────┐
-│              LAYER 6: OUTPUT                          │
-│  • HEIF encoding (JPEG fallback)                     │
-│  • EXIF metadata preservation                        │
-│  • MediaStore integration (gallery visible)          │
-│  • Before/after comparison storage                   │
-└─────────────────────────────────────────────────────┘
+- `IMPLEMENTED`: present in the current runtime feature path.
+- `DECLARED/CONFIGURED`: present in build or native configuration but not used
+  by the current runtime feature path.
+- `PLANNED`: approved future engineering work with no current implementation.
+- `RESEARCH`: exploratory direction that is not committed product behavior.
+
+## Current Runtime Data Flow
+
+The sole executed image path is `IMPLEMENTED`:
+
+```text
+Jetpack Compose camera screen
+  -> CameraX preview
+  -> UI-owned CameraX unbind
+  -> Camera2 single YUV_420_888 capture
+  -> copied image planes on the JVM heap
+  -> NV21 conversion and output-orientation rotation
+  -> ProShot Natural v0 global luma and chroma LUTs
+  -> JPEG compression
+  -> MediaStore save (Pictures/ProShot on API 29+; default shared location on API 26-28)
+  -> UI-triggered CameraX rebind
 ```
 
-> **Warmth-unit TODO:** The "+3-5K" and "+8-10K" values in Layer 5 above refer
-> to thousands of Kelvin (3,000–5,000 K shift). The `LookProfile` data contract
-> stores `globalWarmthShiftKelvin` and `RegionTuning.warmthShiftKelvin` as small
-> integers (e.g. 4, 8). Whether these integers represent true Kelvin deltas,
-> thousands of Kelvin, or product-relative slider units **must be resolved
-> before the color-science shader implementation consumes them**.
+This is an early single-frame, CPU-based prototype. It is not currently a
+temporal, RAW, linear high-bit, semantic, or native multi-frame pipeline.
 
-> **v0 Processing Hook Implementation:**
-> In version 0, a pure Kotlin CPU-based processing hook (`LookProfileNv21Processor`) bridges the capture
-> and gallery output by applying the global tone curve and global saturation scale to the NV21 buffer
-> before JPEG compression. Both luma (tone curve) and chroma (saturation) transforms are precomputed as
-> 256-element byte look-up tables (LUTs) per frame, eliminating per-pixel floating-point math and reducing
-> the inner loops to simple array index operations. This enables fast, deterministic correctness testing
-> on JVM and Android before native shader/GPU compute blocks are fully wired.
+## Implemented Components
 
-> **Output privacy note:** Normal saves go through Android MediaStore so photos
-> appear in the user's gallery. After a photo is saved there, access is governed
-> by Android, gallery apps, user-granted permissions, device security, and any
-> user-enabled cloud backup. ProShot should remain local-first and
-> permission-minimal by default.
+### CameraX Preview Ownership
 
-> **Capture Orchestration Coordinator:**
-> The physical capture orchestration is decoupled from Compose UI state through `CaptureCoordinator`. The
-> coordinator manages physical camera burst capture (single frame YUV for v0), orientation adjustments,
-> look profile color science mapping, and gallery output saving, running stages on appropriate background
-> thread dispatchers (`Dispatchers.Default` for pixel work and `Dispatchers.IO` for MediaStore interactions).
+`CameraScreen` owns the CameraX preview lifecycle transition. Before a photo it
+unbinds CameraX use cases on the main thread. After capture completes or fails,
+the screen changes its reactive preview key so the preview binding effect runs
+again.
 
-> **Capture Latency Diagnostics:**
-> To measure and diagnose latency across the pipeline, `CaptureTiming` and `CaptureTimingTracker` collect and report millisecond-level durations of key stages (CameraX unbind/rebind, Camera2 open/configure/warm-up/autofocus/capture, YUV conversion, look profile processing, and saves). In debug builds, these diagnostics are propagated to the Compose UI layer and displayed in the debug HUD, while remaining completely inactive and hidden in release builds. AE warm-up and AF wait latencies are measured sequentially in separate pre-capture phases to maximize focus and exposure reliability.
+`CaptureCoordinator` does not own CameraX or receive a camera provider. It owns
+the Camera2 capture-to-save sequence after the UI unbind and before the UI
+requests rebind. This split ownership is current technical debt, not the target
+architecture.
 
-> **Pre-Capture AF/AE Policy:**
-> Pre-capture runs sequentially: bounded AE warm-up (minimum 3, maximum 12
-> repeating results), bounded AF wait/lock (maximum 30 qualifying repeating
-> results), then still capture. Default-center capture prefers
-> `CONTROL_AF_MODE_CONTINUOUS_PICTURE` and falls back to
-> `CONTROL_AF_MODE_AUTO`. A user tap with a mappable AF region prefers `AUTO`
-> and falls back to continuous-picture mode only when `AUTO` is unavailable.
-> If AF regions are unsupported or active-array metadata is unavailable, the
-> requested tap is reported with an explicit fallback and AF uses the safe
-> default-center strategy; a supported tapped AE region remains independent.
->
-> `AUTO` submits exactly one `CONTROL_AF_TRIGGER_START` request. Its dedicated
-> callback must report successful completion before repeating results can count
-> toward readiness. The controller then requires two subsequent repeating
-> results and accepts only `FOCUSED_LOCKED`; stale results queued before the
-> trigger boundary are ignored. Trigger submission failure, capture failure, or
-> sequence abort ends the capture as a failure. Continuous-picture mode sends no
-> AF trigger, requires eight repeating results, and then accepts
-> `FOCUSED_LOCKED` or `PASSIVE_FOCUSED`. Null AF states and unknown active modes
-> fail closed, while fixed-focus cameras skip the AF wait.
->
-> Focus targets use normalized coordinates with AF size `0.04f`, AE size
-> `0.10f`, and weight `1000`. `PreviewTapFocusMapper` accounts for sensor
-> orientation, and `ActiveArrayCropCalculator` maps rectangles into the selected
-> YUV stream crop. Rectangles clamp to crop bounds. AF outcome diagnostics latch
-> one immutable sample from the result or failure that ended the wait, including
-> request provenance, so later callbacks cannot replace the displayed outcome.
-> The CameraX preview may use a different aspect ratio than the Camera2 capture
-> stream; taps outside the capture crop clamp to its boundary. Matching those
-> preview and capture aspects remains a future refinement.
+### Camera2 Capture
 
-> **Focus/Lens Diagnostics:**
-> Focus/lens diagnostics are debug-only evidence used to analyze physical lens limits, hardware levels, available focal lengths, timestamp correlation, and AE/AF pre-capture outcomes for a still capture. This data helps diagnose close-subject focus issues without changing active capture policies.
+`SingleFrameCaptureController` opens the primary back camera, configures an
+`ImageReader`, and captures one `YUV_420_888` frame. The current pre-capture
+order is:
 
-## Data Types
+1. AE warm-up with a minimum of 3 and maximum of 12 repeating results.
+2. AF wait/lock with a maximum of 30 repeating callbacks.
+3. One still capture and immediate copied-plane copy.
 
-```kotlin
-data class ImageFrame(
-    val buffer: ByteBuffer,       // RAW or YUV data
-    val width: Int,
-    val height: Int,
-    val format: Int,              // ImageFormat.RAW_SENSOR or YUV_420_888
-    val exposureNs: Long,         // Exposure time in nanoseconds
-    val iso: Int,                 // Sensor sensitivity
-    val sharpnessScore: Float,    // Laplacian variance
-    val timestamp: Long           // Capture timestamp
-)
+Default-center focus prefers `CONTINUOUS_PICTURE` and falls back to `AUTO`.
+A user tap with a supported AF region prefers `AUTO`; unsupported tap targeting
+is reported explicitly and uses the default-center AF strategy. AUTO submits
+one trigger request, waits for that trigger result, and then requires two
+qualifying repeating results. Continuous-picture mode uses an eight-result
+gate. AF and AE regions use crop-aware normalized coordinate mapping.
 
-data class SemanticMasks(
-    val faceMasks: List<FaceMask>,  // Per-face masks
-    val skinMask: FloatArray,       // [0, 1] soft mask for skin regions
-    val skyMask: FloatArray,        // [0, 1] soft mask for sky
-    val personMask: FloatArray,     // [0, 1] soft mask for person(s)
-    val sceneType: SceneType        // INDOOR, OUTDOOR_DAY, OUTDOOR_NIGHT, etc.
-)
+### Capture-to-Save Coordination
 
-data class FaceMask(
-    val boundingBox: RectF,
-    val landmarks: List<PointF>,    // 478 landmarks
-    val skinRegion: FloatArray,     // Soft mask for this face's skin
-    val meanLuminance: Float        // Average brightness of face region
-)
+`CaptureCoordinator` always calls `captureSingleFrame`. It then:
 
-sealed class SceneType {
-    object IndoorWarm : SceneType()
-    object IndoorCool : SceneType()
-    object OutdoorDay : SceneType()
-    object OutdoorGoldenHour : SceneType()
-    object OutdoorNight : SceneType()
-    object Portrait : SceneType()
-    object Landscape : SceneType()
-}
-```
+1. Converts copied YUV planes to a contiguous NV21 byte array.
+2. Rotates NV21 pixels to the resolved output orientation.
+3. Optionally compresses and saves an unprocessed baseline JPEG in debug mode.
+4. Applies the ProShot Natural v0 LUT processor.
+5. Compresses the processed NV21 array to JPEG.
+6. Saves through `GalleryImageSaver`.
 
-## Key Algorithms
+Normal release capture saves one final JPEG. Debug paired output performs an
+additional baseline compression and save and then saves the processed result.
 
-### Frame Selection (Sharpness Scoring)
-```
-For each captured frame:
-  1. Convert to grayscale
-  2. Apply 3x3 Laplacian kernel
-  3. sharpnessScore = variance(laplacian_output)
-  4. Reference frame = argmax(sharpnessScore)
-```
+### ProShot Natural v0 Processing
 
-### Skin Tone Protection
-```
-For each pixel in skin mask region:
-  1. Convert RGB → HSL
-  2. Store original hue (H_orig)
-  3. Apply all tone/contrast adjustments in L and S channels
-  4. Restore H = H_orig (hue lock)
-  5. Clamp S adjustment to ±10% of original
-  6. Convert HSL → RGB
-```
+The current input is vendor-processed YUV converted to NV21. The pure-Kotlin
+processor creates a new NV21 array and applies:
 
-### ProShot Natural Tone Curve
-```
-Control points (input → output, 0-255 range):
-  (0, 5)       — slight black lift
-  (32, 38)     — shadow lift
-  (64, 72)     — lower-mid lift
-  (128, 132)   — midtone subtle boost
-  (192, 188)   — highlight gentle compression
-  (224, 218)   — upper highlight rolloff
-  (255, 250)   — white point soft clip
-Interpolation: cubic spline
-```
+- A global luma tone-curve LUT using piecewise-linear interpolation.
+- A global chroma-saturation LUT centered on neutral chroma value 128.
 
-## Dependencies
+The runtime does not consume `globalWarmthShiftKelvin`, skin controls, face
+targets, regional tuning, or semantic masks. Those fields exist in the
+`LookProfile` contract, but warmth, skin, face, semantic, and other localized
+transforms remain `PLANNED`.
 
-| Library | Version | Purpose |
-|:---|:---|:---|
-| CameraX | 1.4.x | Preview rendering |
-| Camera2 | platform | Burst capture control |
-| OpenCV Android | 4.9.x | Frame alignment (NDK) |
-| TensorFlow Lite | 2.16.x | ML model inference |
-| MediaPipe Tasks | 0.10.x | Face detection, landmarks |
-| Hilt | 2.51.x | Dependency injection |
-| Jetpack Compose | 1.7.x | UI framework |
-| Material3 | 1.3.x | Design system |
-| Coil | 2.7.x | Image loading in gallery |
-| Room | 2.6.x | Photo metadata database |
+Global tone and color transforms may operate on the full frame. Any future
+localized, semantic, subject-specific, or region-selective enhancement must
+use a soft mask and preserve a deterministic unmasked fallback.
 
-## Performance Targets
+### MediaStore Output
 
-| Operation | Budget | Hardware |
-|:---|:---|:---|
-| Burst capture (5 frames) | <500ms | Camera sensor |
-| Frame alignment | <300ms | CPU (OpenCV NDK) |
-| Frame merging | <200ms | GPU (Vulkan/GLES) |
-| Semantic analysis | <50ms | NPU/GPU (TFLite) |
-| Enhancement | <150ms | GPU (AGSL) |
-| Color science | <50ms | GPU |
-| **Total** | **<1.5s** | |
+`GalleryImageSaver` writes JPEG bytes to Android MediaStore. On Android 10 and
+later it uses `MediaStore.Images.Media.RELATIVE_PATH` and publishes app-owned
+output under `Pictures/ProShot`. On API 26-28 it uses the default shared
+MediaStore location and the legacy write permission; that output is not
+app-owned in the scoped-storage sense. After publication, Android, gallery apps,
+device security, and user cloud-backup settings govern access and copies.
 
-## Graceful Degradation
+### Post-Capture Debug HUD
 
-Graceful degradation preserves the selected look profile. The app may reduce
-capture cost, processing precision, or acceleration, but it should not fall back
-to a generic Android-camera look when a valid image buffer exists.
+The debug overlay is `IMPLEMENTED`, but it is not a comprehensive compatibility
+report and its capture metrics are not live. The screen displays stored values
+after a photo completes.
 
-| Capability Missing | Fallback | Look Rule |
-|:---|:---|:---|
-| Full RAW/manual/burst support available | `FULL_COMPUTATIONAL` | Full pipeline with selected look profile |
-| No RAW support | `YUV_BURST` using YUV_420_888 | Same ProShot Natural look profile |
-| Camera2 LEGACY or external camera level | `SINGLE_FRAME_ENHANCED` | Single frame still receives tone/color/skin treatment |
-| No burst support | `SINGLE_FRAME_ENHANCED` | Preserve ProShot Natural tone curve and warmth |
-| No GPU delegate | CPU processing fallback | Same look, slower execution |
-| Low memory (<3GB) | Reduce burst count or single-frame enhanced path | Same look, lower cost |
-| No face detected | Skip face-specific processing, apply global and available regional tuning | Same look without face-only adjustments |
-| Processing timeout (>3s) | Skip alignment, apply color science only | Same look profile on the best available frame |
-| Camera unavailable or no usable image buffer | `BASIC_CAPTURE` | Emergency path; apply minimal look transform if a frame exists |
+The fixed capability summary renders:
 
-`CompatibilityPolicy` owns the tier decision so device-specific workarounds stay
-out of core capture and processing algorithms.
+- Selected policy tier and look profile.
+- Camera hardware level.
+- GPU-delegate capability indicator.
+- Semantic-mask capability indicator.
+
+When available, the timing section renders preview unbind/rebind, camera open,
+session configuration, AE warm-up, AF wait/lock, still capture/copy, total
+Camera2 capture, YUV conversion/rotation, baseline compression/save, look
+processing, final compression/save, and total pipeline durations.
+
+When available, the focus section renders camera and lens characteristics,
+available and selected AF modes, requested and effective focus source, fallback
+reason, normalized target and region sizes, region support and applied regions,
+metering crop, result-side AF/AE regions and crop, trigger status, request
+provenance, AE/AF outcomes, timestamp correlation, and captured dimensions.
+
+A report containing app, SDK, device, ABI, memory, complete support flags,
+fallback reasons, and save outcomes is `PLANNED`.
+
+### Hilt Bootstrap
+
+Hilt application and activity bootstrap is `IMPLEMENTED` through
+`@HiltAndroidApp` and `@AndroidEntryPoint`. Capture controllers, encoders,
+savers, and service dependencies are not yet fully injected.
+
+## Data Models
+
+`CopiedImageFrame` is `IMPLEMENTED`. It stores:
+
+- Image format.
+- Width and height.
+- Sensor timestamp.
+- Copied planes, each containing row stride, pixel stride, and a byte array.
+
+It does not store ISO, exposure time, sharpness score, or semantic metadata. A
+richer capture metadata model and frame-scoring data are `PLANNED`.
+
+## Declared or Configured Components
+
+### Native Proof
+
+The C++17 `proshot` shared library is `DECLARED/CONFIGURED`. It builds from
+`native-pipeline.cpp`, links only the Android log library, and `MainActivity`
+attempts to load it at startup. `stringFromJNI()` is declared as a JNI proof
+method but is not invoked. The native library remains outside the
+image-processing path. Alignment and merge implementation are absent.
+
+OpenCV integration is `PLANNED`, not configured. The version catalog contains
+an unused `4.9.0` value and CMake contains commented future setup instructions,
+but there is no OpenCV dependency, package discovery, include path, or linked
+OpenCV target.
+
+### Dependency Inventory
+
+| Component | Repository version source | Status | Current use |
+|:---|:---|:---|:---|
+| CameraX core, Camera2 adapter, lifecycle, and view | `1.4.0-alpha05` catalog value | `IMPLEMENTED` | Preview and lifecycle binding |
+| Camera2 platform API | Android platform | `IMPLEMENTED` | Still capture and pre-capture control |
+| Jetpack Compose and Material3 | Compose BOM `2024.05.00` | `IMPLEMENTED` | Camera UI and debug overlay |
+| Hilt | `2.51.1` catalog value | `IMPLEMENTED` | Application/activity bootstrap only |
+| CameraX Extensions | `1.4.0-alpha05` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no extension route |
+| TensorFlow Lite and GPU delegate | `2.16.1` catalog value | `DECLARED/CONFIGURED` | Dependencies declared; no model loading or inference |
+| MediaPipe Tasks Vision | `0.10.13` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no runtime task |
+| Coil Compose | `2.7.0` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no runtime image-loading feature |
+| Room runtime, KTX, and compiler | `2.6.1` catalog value | `DECLARED/CONFIGURED` | Dependencies and compiler declared; no database path |
+| Native `proshot` shared library | CMake `3.22.1`, C++17 | `DECLARED/CONFIGURED` | Library load attempt and uninvoked JNI proof method only |
+| OpenCV integration | Unused catalog value `4.9.0` | `PLANNED` | Not integrated or linked |
+
+CameraX is pre-release and requires a controlled future stable-version
+migration. Dependency removal, activation, and upgrades are not part of the
+current runtime architecture.
+
+## Compatibility Policy Boundary
+
+`CompatibilityPolicy` is an `IMPLEMENTED` capability classifier. It can return
+`FULL_COMPUTATIONAL`, `YUV_BURST`, `SINGLE_FRAME_ENHANCED`, or `BASIC_CAPTURE`
+decisions. The UI currently uses the selected look profile and displays the
+classification, but no router dispatches tier-specific capture paths.
+
+All shutter actions that reach `CaptureCoordinator` execute the same
+single-frame YUV path. A camera-unavailable classification does not produce a
+photo. A real compatibility router and every tier-specific route are `PLANNED`.
+
+## Planned Architecture
+
+Approved `PLANNED` work includes:
+
+- Capture ownership decomposition and a persistent Camera2 session.
+- Bounded pre-shutter frame history and ZSL evaluation.
+- Timestamp-correlated frame selection and sharpness scoring.
+- RAW or YUV burst capture, alignment, merge, and ghost rejection.
+- HDR/night processing and device-specific quirk routing.
+- OpenCV or other native processing only after explicit integration and tests.
+- Semantic masks and soft-masked local enhancement.
+- Warmth, skin, face, regional tuning, and metadata controls.
+- Possible OpenGL ES compute work or AGSL runtime-shader evaluation.
+- Linear/high-bit processing and HEIF or Ultra HDR output.
+- Full compatibility reporting and runtime/instrumented lifecycle coverage.
+
+Optional advisory AI remains `RESEARCH`; it is not committed product behavior.
+
+## Memory Pressure Baseline
+
+The current path allocates or retains several CPU-side buffers during a photo:
+
+- Copied Y, U, and V plane byte arrays.
+- A contiguous NV21 conversion buffer.
+- A rotated NV21 buffer when rotation is required.
+- A processed NV21 output array.
+- JPEG compression streams and final JPEG byte arrays.
+- Additional baseline JPEG compression and output work in debug paired mode.
+
+No stable live-heap multiplier has been measured. Future GPU work may reduce
+selected processing buffers, but frame copying, JPEG encoding, and output arrays
+can still create CPU heap pressure.
+
+## Privacy and Permission Baseline
+
+The manifest currently declares:
+
+- `CAMERA`.
+- `WRITE_EXTERNAL_STORAGE` with `maxSdkVersion=28` for Android 8 and 9 saving.
+
+It does not declare gallery-read, location, or `INTERNET` permission. Normal
+saving is local through MediaStore; this does not control gallery access or
+user-enabled cloud backup after publication.
+
+## Current Technical Debt
+
+- CameraX unbind/rebind remains in the Compose screen while capture-to-save
+  orchestration is separate.
+- Each shutter action tears down CameraX preview and opens a new Camera2 session.
+- `CameraScreen` and `SingleFrameCaptureController` remain large ownership areas.
+- No runtime/instrumented test covers the complete unbind, capture, and rebind
+  lifecycle under interruption or memory pressure.
+- Compatibility decisions are classifications without an execution router.
+- The native library is a proof only, and OpenCV is not integrated.
+- Several dependencies are declared but unused.
+- CameraX uses a pre-release catalog version.
+
+## Pre-Release Watch Items
+
+Before a production release, explicitly review:
+
+- The current `android:allowBackup="true"` policy and backup behavior.
+- Privacy-policy readiness for the shipped feature and permission set.
+- Image metadata controls and metadata minimization.
+- Dependency cleanup, stable-version migration, and release notes.
+- Runtime instrumentation and representative device-matrix coverage.
+- Release-build behavior, permissions, shrinking, logging, and save validation.

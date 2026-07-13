@@ -1,85 +1,153 @@
 # ProShot Engineering Guardrails
 
+## Status Vocabulary
+
+- `IMPLEMENTED`: present in the current runtime feature path.
+- `DECLARED/CONFIGURED`: present in build or native configuration but not used
+  by the current runtime feature path.
+- `PLANNED`: approved future engineering work with no current implementation.
+- `RESEARCH`: exploratory direction that is not committed product behavior.
+
+Engineering proposals must not describe `DECLARED/CONFIGURED`, `PLANNED`, or
+`RESEARCH` work as shipping behavior.
+
+## Current Processing Boundary
+
+ProShot Natural v0 is `IMPLEMENTED` as two global operations on vendor-processed
+NV21:
+
+- A luma tone-curve LUT using piecewise-linear interpolation.
+- A chroma-saturation LUT.
+
+`LookProfile` also contains warmth, skin, face, and regional fields, but current
+processing does not consume them. The presence of a contract field is not proof
+that its transform is implemented.
+
 ## Look Profile Extensibility
 
-The first product iteration ships with one public processing profile:
-ProShot Natural. The pipeline should still treat that look as configuration,
-not as a permanent hard-coded assumption.
+The public processing profile is ProShot Natural. Core stages should depend on
+neutral contracts rather than product-positioning comparisons or device-family
+checks.
 
-Core stages should depend on neutral data contracts:
+- New profile data belongs in the profile catalog.
+- Capture and processing algorithms must not contain scattered model checks.
+- A new field must not be presented as active until an executed stage consumes
+  it and tests its behavior.
+- Unresolved units, including warmth values, must be defined before processing
+  consumes them.
 
-- `LookProfile` describes the selected post-processing look.
-- `ToneCurvePoint` stores normalized tone curve control points.
-- `RegionTuning` stores semantic-region adjustments.
-- `SemanticRegion` identifies regions produced by semantic analysis.
+## Global and Local Processing Rules
 
-Future look profiles should add new profile data to the catalog and reuse the
-same capture, merging, semantic analysis, enhancement, color science, and output
-stages. Device-family-inspired tuning should stay outside core algorithms unless
-a future profile proves that a new algorithmic stage is required.
+- Global tone and color transforms may operate on the full frame.
+- Localized, semantic, subject-specific, or region-selective enhancement must
+  use a soft mask with values in `[0.0, 1.0]`.
+- Local masks must use feathered edges appropriate to the operation.
+- Every masked operation must preserve a deterministic unmasked fallback.
+- Missing or low-confidence masks must not cause a destructive full-frame local
+  adjustment.
 
-## Compatibility Without Losing The Look
+Semantic masks and localized enhancement are `PLANNED`; these rules become
+runtime requirements when those features are implemented.
 
-Fallback changes the execution method, not the visual goal. Every valid captured
-frame should still route through the selected `LookProfile`; version 1 uses
-ProShot Natural for every supported device tier.
+## Capture and Compatibility Rules
 
-Compatibility rules:
+The sole `IMPLEMENTED` capture route is one Camera2 `YUV_420_888` frame followed
+by copied-plane conversion, orientation, global LUT processing, JPEG
+compression, and MediaStore save.
 
-- Prefer RAW burst when available, then YUV burst, then single-frame enhanced
-  processing, then basic capture only as an emergency path.
-- Do not downgrade limited devices into a generic Android-camera look.
-- Keep tone curve, warmth, skin hue lock, face luminance, highlight rolloff, and
-  regional tuning behavior consistent across fallback tiers where the required
-  inputs exist.
-- Put device-specific workarounds in a compatibility or quirk layer instead of
-  scattering model checks through capture and processing code.
-- Any feature that adds camera, ML, native, or storage assumptions must state
-  its fallback behavior before merge.
+`CompatibilityPolicy` is an `IMPLEMENTED` capability classifier, not an
+execution router. Tier-specific dispatch is `PLANNED`.
+
+If temporal, burst, RAW, or tier-specific routes are implemented later:
+
+- Preserve the selected ProShot-owned visual target when a valid image buffer
+  exists.
+- Define the fallback order and failure behavior before merge.
+- Do not claim that camera-unavailable or no-buffer states can produce a photo.
+- Keep device workarounds in a compatibility or quirk layer.
+- Require timestamp correlation and bounded ownership for multi-frame buffers.
+- Keep frame selection deterministic and testable.
+
+## Native and GPU Rules
+
+The native `proshot` JNI proof is `DECLARED/CONFIGURED`; it is not image
+processing. OpenCV integration is `PLANNED` and must not be described as linked
+or available until build configuration and runtime code prove it.
+
+Future GPU work must identify the actual API:
+
+- OpenGL ES compute work may use compute shaders on supported devices.
+- AGSL provides runtime shader evaluation and must not be described as a
+  compute-shader API.
+- CPU fallback must remain deterministic and safe.
+- GPU use must not be claimed to eliminate all CPU-side frame, JPEG, or output
+  allocations.
 
 ## App Size Policy
 
-ProShot should stay a normal-sized camera app, even as image quality improves.
-Camera and ML features make it larger than a simple utility app, but size should
-remain controlled by default.
+ProShot should remain a normal-sized camera app as features are added.
 
-Size guardrails:
+- Publish production builds as Android App Bundles when release distribution is
+  established.
+- Keep native ABI output limited to supported targets.
+- Add ML models only with a documented install-size and runtime-memory impact.
+- Prefer appropriately optimized models when quality remains acceptable.
+- Do not bundle unused model packs, calibration data, or profile assets.
+- Review declared-unused dependencies before release rather than assuming they
+  are harmless.
 
-- Publish release builds as Android App Bundles so Play can deliver device
-  specific splits.
-- Keep native ABI output focused on supported ARM targets unless emulator or
-  desktop testing needs a temporary debug-only exception.
-- Prefer quantized or otherwise optimized TensorFlow Lite models when visual
-  quality remains acceptable.
-- Do not bundle extra phone-style models, lookup tables, or calibration packs
-  until those profiles actually ship.
-- Consider optional on-demand model downloads only after bundled ML assets become
-  the dominant APK or install-size cost.
+## Privacy and Photo Safety
 
-Any task that adds ML models, native libraries, or profile assets should report
-the expected install-size impact before merge.
+Captures are processed locally by default. Normal JPEG output is published
+through MediaStore. API 29+ uses `MediaStore.Images.Media.RELATIVE_PATH` and
+publishes app-owned output under `Pictures/ProShot`. API 26-28 uses the default
+shared MediaStore location and the legacy write permission; that output is not
+app-owned in the scoped-storage sense. After publication, Android, gallery apps,
+device security, and user cloud-backup settings govern access and copies.
 
-## Privacy And Photo Safety
-
-ProShot should protect user photos by design, while staying honest about the
-limits of app-level security. Captures are processed locally by default, but
-once a photo is saved to the device gallery, access is governed by Android, the
-gallery app, user-granted permissions, device security, and any user-enabled
-cloud backup.
+Current permissions are `CAMERA` plus legacy `WRITE_EXTERNAL_STORAGE` through
+API 28. There is no gallery-read, location, or `INTERNET` permission.
 
 Privacy guardrails:
 
-- Do not add the `INTERNET` permission unless a future feature has explicit
-  user value, consent, and a privacy impact note.
-- Do not request gallery read permissions unless a real gallery browsing,
-  import, or before/after review feature needs them.
-- Do not upload images, process images in the cloud, or run image-content
-  analytics by default.
-- Do not log raw image buffers, JPEG bytes, gallery paths, EXIF dumps, or other
-  photo-derived payloads.
-- Keep beginner-facing privacy language clear: local-first and
-  permission-minimal, without promising absolute security.
+- Do not add `INTERNET` without explicit user value, consent, and a privacy
+  impact review.
+- Do not request gallery-read permission without an implemented user feature
+  that requires it.
+- Do not upload photos or run image-content analytics by default.
+- Do not log raw image buffers, JPEG bytes, gallery paths, EXIF dumps, faces,
+  or other photo-derived payloads.
+- Review backup behavior, metadata collection, metadata retention, and privacy
+  policy readiness before release.
+- Use local-first, permission-minimal language without promising absolute
+  security.
 
-Any new permission, network feature, analytics SDK, crash-reporting SDK,
-backup behavior, sharing/export flow, or cloud feature must include a privacy
-impact note before merge.
+Any new permission, network feature, analytics SDK, crash reporting SDK,
+backup behavior, sharing flow, or cloud feature requires a privacy impact note.
+
+## Machine Learning and AI Policy
+
+TensorFlow Lite and MediaPipe dependencies are `DECLARED/CONFIGURED`; no runtime
+model loading or inference is implemented.
+
+Optional advisory AI is `RESEARCH`. If approved later, it must be:
+
+- Advisory rather than the only capture decision path.
+- Versioned and confidence-aware.
+- Bounded in inputs and outputs.
+- Optional for the user where appropriate.
+- Backed by a deterministic non-ML fallback.
+- Local by default unless a separately approved feature provides clear consent
+  and privacy controls.
+
+## Evidence Before Merge
+
+Changes that add capture routes, native code, ML, permissions, storage behavior,
+or new output formats must identify:
+
+- The executed source path.
+- Supported and unsupported device behavior.
+- Failure and fallback handling.
+- Memory and install-size implications.
+- Unit, integration, instrumentation, and device evidence appropriate to risk.
+- Release-build behavior rather than debug-only behavior alone.
