@@ -5,6 +5,7 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Result of comparing the still capture metadata timestamp and the copied image buffer timestamp.
@@ -42,6 +43,8 @@ data class FocusLensDiagnostics(
     val captureHeight: Int? = null,
     val imageFormat: String? = null,
     val focusTargetSource: String? = null,
+    val effectiveFocusTargetSource: String? = null,
+    val focusTargetFallback: String? = null,
     val normalizedTargetX: Float? = null,
     val normalizedTargetY: Float? = null,
     val normalizedAfSize: Float? = null,
@@ -49,7 +52,14 @@ data class FocusLensDiagnostics(
     val afMaxRegions: Int? = null,
     val aeMaxRegions: Int? = null,
     val afRegionApplied: String? = null,
-    val aeRegionApplied: String? = null
+    val aeRegionApplied: String? = null,
+    val meteringCropRegion: String? = null,
+    val resultAfMode: String? = null,
+    val resultAfRegions: String? = null,
+    val resultAeRegions: String? = null,
+    val resultScalerCrop: String? = null,
+    val afTriggerIssued: Boolean? = null,
+    val afResultRequestProvenance: String? = null
 ) {
     /**
      * Formats the diagnostics into a clean, monospace-friendly string for the debug HUD.
@@ -73,7 +83,9 @@ data class FocusLensDiagnostics(
         }
         availableAfModes?.let { if (it.isNotEmpty()) sb.append("  - Available AF: ${it.joinToString(", ")}\n") }
         selectedAfMode?.let { sb.append("  - Selected AF: $it\n") }
-        focusTargetSource?.let { sb.append("  - Focus Source: $it\n") }
+        focusTargetSource?.let { sb.append("  - Requested Focus Source: $it\n") }
+        effectiveFocusTargetSource?.let { sb.append("  - Effective Focus Source: $it\n") }
+        focusTargetFallback?.let { sb.append("  - Focus Fallback: $it\n") }
         if (normalizedTargetX != null && normalizedTargetY != null) {
             sb.append("  - Normalized Target: (${normalizedTargetX}, ${normalizedTargetY})\n")
         }
@@ -83,6 +95,13 @@ data class FocusLensDiagnostics(
         aeMaxRegions?.let { sb.append("  - Max AE Regions: $it\n") }
         afRegionApplied?.let { sb.append("  - AF Region: $it\n") }
         aeRegionApplied?.let { sb.append("  - AE Region: $it\n") }
+        meteringCropRegion?.let { sb.append("  - Metering Crop: $it\n") }
+        sb.append("  - Result AF Mode: ${resultAfMode ?: "UNAVAILABLE"}\n")
+        sb.append("  - Result AF Regions: ${resultAfRegions ?: "UNAVAILABLE"}\n")
+        sb.append("  - Result AE Regions: ${resultAeRegions ?: "UNAVAILABLE"}\n")
+        sb.append("  - Result Crop: ${resultScalerCrop ?: "UNAVAILABLE"}\n")
+        sb.append("  - AF Trigger Issued: ${afTriggerIssued?.toString() ?: "UNAVAILABLE"}\n")
+        sb.append("  - AF Result Request: ${afResultRequestProvenance ?: "UNAVAILABLE"}\n")
 
         aeWarmupExitState?.let { state ->
             val fc = aeWarmupFrameCount?.let { " ($it frames)" } ?: ""
@@ -90,7 +109,11 @@ data class FocusLensDiagnostics(
         }
 
         afWaitExitReason?.let { reason ->
-            val stateStr = afWaitExitState?.let { " State: $it" } ?: ""
+            val stateStr = when {
+                afWaitExitState != null -> " State: $afWaitExitState"
+                reason == "FIXED_FOCUS" || reason == "NOT_RUN" -> ""
+                else -> " State: UNAVAILABLE"
+            }
             val fc = afWaitFrameCount?.let { " ($it frames)" } ?: ""
             sb.append("  - AF Lock: $reason$stateStr$fc\n")
         }
@@ -113,6 +136,21 @@ data class FocusLensDiagnostics(
 }
 
 private fun Float.formatRegionSize(): String = String.format(Locale.US, "%.2f", this)
+
+/**
+ * Immutable metadata sample associated with the callback that ended an autofocus wait.
+ */
+internal data class FocusWaitDiagnosticSample(
+    val resultAfMode: String?,
+    val resultAfRegions: String?,
+    val resultAeRegions: String?,
+    val resultScalerCrop: String?,
+    val afState: String?,
+    val repeatingFrameCount: Int?,
+    val exitReason: String,
+    val afTriggerIssued: Boolean,
+    val requestProvenance: String
+)
 
 /**
  * Pure helper utility to compare timestamps and map Camera2 constants.
@@ -213,15 +251,18 @@ object FocusLensDiagnosticsHelper {
 /**
  * Mutable tracker used during capture to gather focus and lens diagnostics.
  *
- * Fields are marked `@Volatile` because the tracker is written on the camera
- * handler thread (inside Camera2 callbacks) and read on the main/UI thread
- * when `snapshot()` is called after the capture pipeline returns. While
- * coroutine resume boundaries provide happens-before guarantees for most
- * fields, `stillCaptureResultTimestamp` is written in a side-channel
- * `onCaptureCompleted` callback that may fire after the coroutine resumes.
- * Marking all fields volatile eliminates JMM ambiguity at negligible cost.
+ * Scalar fields are marked `@Volatile` because the tracker is written on the
+ * camera handler thread and read after the capture pipeline returns. Two kinds
+ * of callbacks can legitimately arrive late: the still-capture result may
+ * arrive after the image callback resumes its coroutine, and queued AF trigger
+ * or repeating callbacks may arrive after the AF continuation resumes or is
+ * cancelled. The still timestamp therefore remains nullable. AF outcome data
+ * is instead published as one immutable sample through an [AtomicReference];
+ * the first terminal callback wins and later callbacks cannot replace it.
  */
 class FocusLensDiagnosticsTracker {
+    private val afWaitDiagnosticSample = AtomicReference<FocusWaitDiagnosticSample?>(null)
+
     @Volatile var logicalCameraId: String? = null
     /** Physical sub-camera IDs for multi-camera logical cameras. Available on API 28+. Debug-only. */
     @Volatile var physicalCameraIds: List<String>? = null
@@ -237,7 +278,8 @@ class FocusLensDiagnosticsTracker {
     @Volatile var afWaitExitState: String? = null
     @Volatile var afWaitFrameCount: Int? = null
     /**
-     * AF exit reason. Values: `FOCUSED`, `FRAME_CAP_TIMEOUT`, `FIXED_FOCUS`.
+     * AF exit reason. Values: `FOCUSED`, `FRAME_CAP_TIMEOUT`, `FIXED_FOCUS`,
+     * `TRIGGER_FAILED`, `TRIGGER_ABORTED`, or `TRIGGER_SUBMISSION_FAILED`.
      * Initialized to `NOT_RUN` at capture start, meaning the AF lock phase
      * was not reached (e.g. pipeline failed before AF). `FIXED_FOCUS` is a
      * separate label set when the camera reports no triggerable AF mode.
@@ -256,6 +298,8 @@ class FocusLensDiagnosticsTracker {
     @Volatile var captureHeight: Int? = null
     @Volatile var imageFormat: String? = null
     @Volatile var focusTargetSource: String? = null
+    @Volatile var effectiveFocusTargetSource: String? = null
+    @Volatile var focusTargetFallback: String? = null
     @Volatile var normalizedTargetX: Float? = null
     @Volatile var normalizedTargetY: Float? = null
     @Volatile var normalizedAfSize: Float? = null
@@ -264,11 +308,38 @@ class FocusLensDiagnosticsTracker {
     @Volatile var aeMaxRegions: Int? = null
     @Volatile var afRegionApplied: String? = null
     @Volatile var aeRegionApplied: String? = null
+    @Volatile var meteringCropRegion: String? = null
+    @Volatile var resultAfMode: String? = null
+    @Volatile var resultAfRegions: String? = null
+    @Volatile var resultAeRegions: String? = null
+    @Volatile var resultScalerCrop: String? = null
+    @Volatile var afTriggerIssued: Boolean? = null
+
+    /** Clears outcome fields before a new capture starts. */
+    internal fun clearAfWaitOutcome() {
+        afWaitDiagnosticSample.set(null)
+        afWaitExitState = null
+        afWaitFrameCount = null
+        afWaitExitReason = null
+        resultAfMode = null
+        resultAfRegions = null
+        resultAeRegions = null
+        resultScalerCrop = null
+        afTriggerIssued = null
+    }
+
+    /**
+     * Atomically publishes the first terminal AF sample and rejects late replacements.
+     */
+    internal fun publishAfWaitOutcome(sample: FocusWaitDiagnosticSample): Boolean {
+        return afWaitDiagnosticSample.compareAndSet(null, sample)
+    }
 
     /**
      * Creates an immutable [FocusLensDiagnostics] snapshot of the current tracked values.
      */
     fun snapshot(): FocusLensDiagnostics {
+        val afSample = afWaitDiagnosticSample.get()
         return FocusLensDiagnostics(
             logicalCameraId = logicalCameraId,
             physicalCameraIds = physicalCameraIds,
@@ -281,15 +352,17 @@ class FocusLensDiagnosticsTracker {
             selectedAfMode = selectedAfMode,
             aeWarmupExitState = aeWarmupExitState,
             aeWarmupFrameCount = aeWarmupFrameCount,
-            afWaitExitState = afWaitExitState,
-            afWaitFrameCount = afWaitFrameCount,
-            afWaitExitReason = afWaitExitReason,
+            afWaitExitState = if (afSample != null) afSample.afState else afWaitExitState,
+            afWaitFrameCount = if (afSample != null) afSample.repeatingFrameCount else afWaitFrameCount,
+            afWaitExitReason = if (afSample != null) afSample.exitReason else afWaitExitReason,
             stillCaptureResultTimestamp = stillCaptureResultTimestamp,
             copiedImageTimestamp = copiedImageTimestamp,
             captureWidth = captureWidth,
             captureHeight = captureHeight,
             imageFormat = imageFormat,
             focusTargetSource = focusTargetSource,
+            effectiveFocusTargetSource = effectiveFocusTargetSource,
+            focusTargetFallback = focusTargetFallback,
             normalizedTargetX = normalizedTargetX,
             normalizedTargetY = normalizedTargetY,
             normalizedAfSize = normalizedAfSize,
@@ -297,7 +370,14 @@ class FocusLensDiagnosticsTracker {
             afMaxRegions = afMaxRegions,
             aeMaxRegions = aeMaxRegions,
             afRegionApplied = afRegionApplied,
-            aeRegionApplied = aeRegionApplied
+            aeRegionApplied = aeRegionApplied,
+            meteringCropRegion = meteringCropRegion,
+            resultAfMode = if (afSample != null) afSample.resultAfMode else resultAfMode,
+            resultAfRegions = if (afSample != null) afSample.resultAfRegions else resultAfRegions,
+            resultAeRegions = if (afSample != null) afSample.resultAeRegions else resultAeRegions,
+            resultScalerCrop = if (afSample != null) afSample.resultScalerCrop else resultScalerCrop,
+            afTriggerIssued = if (afSample != null) afSample.afTriggerIssued else afTriggerIssued,
+            afResultRequestProvenance = afSample?.requestProvenance
         )
     }
 }

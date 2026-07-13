@@ -69,10 +69,14 @@ import com.proshot.app.camera.CaptureTimingTracker
 import com.proshot.app.camera.FocusLensDiagnostics
 import com.proshot.app.camera.FocusLensDiagnosticsTracker
 import com.proshot.app.camera.SingleFrameCaptureController
+import com.proshot.app.camera.FocusMeteringTarget
+import com.proshot.app.camera.PreviewTapFocusMapper
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
 import com.proshot.app.camera.compat.DeviceCameraCapabilities
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -247,6 +251,17 @@ private fun ActivePreviewContent(
     }
     val scope = rememberCoroutineScope()
 
+    var focusTarget by remember { mutableStateOf(FocusMeteringTarget.center()) }
+    var focusRingVisible by remember { mutableStateOf(false) }
+    var tapPosition by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    var tapCounter by remember { mutableIntStateOf(0) }
+    // Sensor orientation is constant for a given camera and is resolved once at
+    // setup. Using this directly (instead of resolveOutputRotationDegrees) is
+    // correct for the preview-to-sensor tap transform because sensor orientation
+    // does not change with device rotation. Default 90 covers the Nothing Phone 2
+    // back camera.
+    var sensorOrientationDegrees by remember { mutableIntStateOf(90) }
+
     var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
     var lastFocusLensDiagnostics by remember { mutableStateOf<FocusLensDiagnostics?>(null) }
     var activeTimingTracker by remember { mutableStateOf<CaptureTimingTracker?>(null) }
@@ -333,12 +348,28 @@ private fun ActivePreviewContent(
         mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
     }
 
-    // Resolve capabilities off the main thread to avoid blocking on Camera2 HAL IPC.
+    // Resolve capabilities and sensor orientation off the main thread to avoid
+    // blocking on Camera2 HAL IPC. Sensor orientation is constant for the back
+    // camera and is needed synchronously by the tap handler.
     LaunchedEffect(context) {
         capabilityState = withContext(Dispatchers.IO) {
             val caps = CameraCapabilitiesMapper.map(context)
             val decision = CompatibilityPolicy.select(caps)
             caps to decision
+        }
+        sensorOrientationDegrees = withContext(Dispatchers.IO) {
+            try {
+                SingleFrameCaptureController.resolveSensorOrientation(context)
+            } catch (e: Exception) {
+                90 // Nothing Phone 2 back camera default
+            }
+        }
+    }
+
+    if (focusRingVisible && tapPosition != null) {
+        LaunchedEffect(tapCounter) {
+            delay(1500L)
+            focusRingVisible = false
         }
     }
 
@@ -348,6 +379,47 @@ private fun ActivePreviewContent(
             factory = { previewView },
             modifier = Modifier.fillMaxSize()
         )
+
+        // Transparent tap overlay for focus mapping.
+        // Tap handling is fully synchronous: sensor orientation is resolved once
+        // at setup and stored in sensorOrientationDegrees. This eliminates the
+        // async race where rapid double-taps could desynchronize the visible
+        // focus ring position from the actual capture focus target.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(isCapturing) {
+                    detectTapGestures { offset ->
+                        if (!isCapturing && size.width > 0 && size.height > 0) {
+                            val target = PreviewTapFocusMapper.mapToSensorTarget(
+                                tapX = offset.x,
+                                tapY = offset.y,
+                                viewWidth = size.width,
+                                viewHeight = size.height,
+                                rotationDegrees = sensorOrientationDegrees
+                            )
+                            tapCounter++
+                            tapPosition = offset
+                            focusRingVisible = true
+                            focusTarget = target
+                            captureStatusMessage = "Focus set"
+                        }
+                    }
+                }
+        )
+
+        // Focus ring overlay
+        if (focusRingVisible && tapPosition != null) {
+            val pos = tapPosition!!
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = Color.Yellow,
+                    center = pos,
+                    radius = 30.dp.toPx(),
+                    style = Stroke(width = 2.dp.toPx())
+                )
+            }
+        }
 
         // Debug controls (only available in debug builds)
         if (isDebugBuild) {
@@ -458,7 +530,8 @@ private fun ActivePreviewContent(
                                 lookProfile = lookProfile,
                                 isDebug = isDebugBuild,
                                 tracker = tracker,
-                                diagnosticsTracker = diagnosticsTracker
+                                diagnosticsTracker = diagnosticsTracker,
+                                focusTarget = focusTarget
                             ) { status ->
                                 // Map coordinator progress to beginner-safe vocabulary.
                                 captureStatusMessage = mapStatusForDisplay(status)

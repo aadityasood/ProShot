@@ -35,9 +35,8 @@ private const val CAPTURE_TIMEOUT_MS = 8_000L
 private const val AE_WARMUP_MIN_FRAMES = 3
 private const val AE_WARMUP_MAX_FRAMES = 12
 
-// Minimum callbacks before FOCUSED_LOCKED is accepted in AUTO mode.
-// Does not guarantee the trigger frame has been delivered; the trigger
-// result may arrive at frame 3 or later on pipeline-depth-3 HALs.
+// Minimum qualifying repeating results after the AUTO trigger result has
+// established a causal boundary before FOCUSED_LOCKED is accepted.
 private const val AF_TRIGGER_MIN_FRAMES = 2
 
 // Minimum callbacks before PASSIVE_FOCUSED or FOCUSED_LOCKED is accepted
@@ -49,6 +48,112 @@ private const val AF_TRIGGER_MIN_FRAMES = 2
 private const val AF_PASSIVE_MIN_FRAMES = 8
 
 private const val AF_LOCK_MAX_FRAMES = 30
+
+internal enum class FocusTargetFallbackReason {
+    NONE,
+    AF_REGIONS_UNSUPPORTED,
+    ACTIVE_ARRAY_UNAVAILABLE
+}
+
+internal data class EffectiveFocusTargetPolicy(
+    val requestedSource: FocusTargetSource,
+    val effectiveSource: FocusTargetSource,
+    val fallbackReason: FocusTargetFallbackReason
+)
+
+internal fun resolveEffectiveFocusTargetPolicy(
+    requestedSource: FocusTargetSource,
+    maxAfRegions: Int,
+    activeArrayAvailable: Boolean
+): EffectiveFocusTargetPolicy {
+    if (requestedSource != FocusTargetSource.USER_TAP) {
+        return EffectiveFocusTargetPolicy(
+            requestedSource = requestedSource,
+            effectiveSource = requestedSource,
+            fallbackReason = FocusTargetFallbackReason.NONE
+        )
+    }
+    val fallbackReason = when {
+        !activeArrayAvailable -> FocusTargetFallbackReason.ACTIVE_ARRAY_UNAVAILABLE
+        maxAfRegions <= 0 -> FocusTargetFallbackReason.AF_REGIONS_UNSUPPORTED
+        else -> FocusTargetFallbackReason.NONE
+    }
+    return EffectiveFocusTargetPolicy(
+        requestedSource = requestedSource,
+        effectiveSource = if (fallbackReason == FocusTargetFallbackReason.NONE) {
+            requestedSource
+        } else {
+            FocusTargetSource.DEFAULT_CENTER
+        },
+        fallbackReason = fallbackReason
+    )
+}
+
+internal enum class AutoFocusWaitOutcome {
+    FOCUSED,
+    FRAME_CAP_TIMEOUT,
+    TRIGGER_FAILED,
+    TRIGGER_ABORTED,
+    TRIGGER_SUBMISSION_FAILED
+}
+
+internal class AutoFocusWaitPolicy(private val afMode: Int) {
+    var triggerBoundaryObserved: Boolean = afMode != CaptureRequest.CONTROL_AF_MODE_AUTO
+        private set
+    var repeatingFrameCount: Int = 0
+        private set
+    var qualifyingRepeatingResultCount: Int = 0
+        private set
+    var outcome: AutoFocusWaitOutcome? = null
+        private set
+
+    fun onTriggerCompleted() {
+        if (outcome == null && afMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
+            triggerBoundaryObserved = true
+        }
+    }
+
+    fun onTriggerFailed(aborted: Boolean): AutoFocusWaitOutcome? {
+        if (outcome != null || triggerBoundaryObserved) {
+            return null
+        }
+        outcome = if (aborted) {
+            AutoFocusWaitOutcome.TRIGGER_ABORTED
+        } else {
+            AutoFocusWaitOutcome.TRIGGER_FAILED
+        }
+        return outcome
+    }
+
+    fun onRepeatingCompleted(afState: Int?): AutoFocusWaitOutcome? {
+        if (outcome != null || !triggerBoundaryObserved) {
+            return null
+        }
+        repeatingFrameCount++
+        qualifyingRepeatingResultCount++
+        outcome = when {
+            SingleFrameCaptureController.isAutoFocusReadyForStillCapture(
+                qualifyingRepeatingResultCount,
+                afState,
+                afMode
+            ) -> AutoFocusWaitOutcome.FOCUSED
+            repeatingFrameCount >= AF_LOCK_MAX_FRAMES -> AutoFocusWaitOutcome.FRAME_CAP_TIMEOUT
+            else -> null
+        }
+        return outcome
+    }
+
+    fun onRepeatingFailed(): AutoFocusWaitOutcome? {
+        if (outcome != null || !triggerBoundaryObserved) {
+            return null
+        }
+        repeatingFrameCount++
+        if (repeatingFrameCount >= AF_LOCK_MAX_FRAMES) {
+            outcome = AutoFocusWaitOutcome.FRAME_CAP_TIMEOUT
+        }
+        return outcome
+    }
+}
 
 /**
  * Represent standard image dimension in a pure Kotlin format to enable robust
@@ -117,31 +222,53 @@ object SingleFrameCaptureController {
     /**
      * Selects the autofocus mode to use for the one-shot still-capture lock sequence.
      *
-     * `CONTINUOUS_PICTURE` is preferred for the still-capture experiment because it
-     * lets the HAL converge passively on the center metering region before capture.
-     * `AUTO` remains the fallback for devices that do not expose continuous picture
-     * AF and is the only mode that receives an explicit `CONTROL_AF_TRIGGER_START`.
-     * Returns null for fixed-focus devices where no autofocus trigger is useful.
+     * Default-center capture prefers `CONTINUOUS_PICTURE` and falls back to `AUTO`.
+     * A supported user-tap target prefers `AUTO` for one deterministic trigger cycle
+     * and falls back to `CONTINUOUS_PICTURE` when `AUTO` is unavailable. Callers must
+     * resolve unsupported tap targeting to the default-center policy before invoking
+     * this selector. Returns null when neither supported active AF mode is available.
      */
-    fun selectAutoFocusModeForStillCapture(availableModes: IntArray?): Int? {
+    fun selectAutoFocusModeForStillCapture(availableModes: IntArray?, source: FocusTargetSource): Int? {
         if (availableModes == null) {
             return null
         }
         val modes = availableModes.toSet()
-        return when {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            CaptureRequest.CONTROL_AF_MODE_AUTO in modes -> CaptureRequest.CONTROL_AF_MODE_AUTO
-            else -> null
+        return when (source) {
+            FocusTargetSource.DEFAULT_CENTER -> {
+                when {
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
+                        CaptureRequest.CONTROL_AF_MODE_AUTO
+                    else -> null
+                }
+            }
+            FocusTargetSource.USER_TAP -> {
+                when {
+                    CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
+                        CaptureRequest.CONTROL_AF_MODE_AUTO
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    else -> null
+                }
+            }
         }
+    }
+
+    /**
+     * Returns true if the selected autofocus mode requires an explicit trigger start command.
+     */
+    fun shouldTriggerAutoFocus(afMode: Int?): Boolean {
+        return afMode == CaptureRequest.CONTROL_AF_MODE_AUTO
     }
 
     /**
      * Returns true when an AF state is safe to leave the autofocus wait loop.
      *
      * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` is accepted after
-     * [AF_TRIGGER_MIN_FRAMES] (2 frames). The trigger forces a deterministic
-     * scan cycle, so the gate only needs to exceed pipeline depth.
+     * [AF_TRIGGER_MIN_FRAMES] (2 qualifying repeating results). The caller
+     * starts this count only after the one-shot trigger result is observed, so
+     * pre-trigger pipeline results cannot satisfy the gate.
      *
      * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE`, `PASSIVE_FOCUSED` and
      * `FOCUSED_LOCKED` are accepted only after [AF_PASSIVE_MIN_FRAMES]
@@ -201,6 +328,24 @@ object SingleFrameCaptureController {
     }
 
     /**
+     * Returns the back camera's physical sensor orientation in degrees.
+     *
+     * Unlike [resolveOutputRotationDegrees], this value is constant for a given
+     * camera (it does not change with display rotation). It represents the
+     * clockwise angle by which the sensor is rotated relative to the device's
+     * natural (portrait) orientation. This is the correct input for mapping
+     * preview tap coordinates into sensor-normalized space via
+     * [PreviewTapFocusMapper].
+     */
+    fun resolveSensorOrientation(context: Context): Int {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: throw IllegalStateException("CameraManager is not available")
+        val cameraId = resolvePrimaryCameraId(manager)
+        return manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+    }
+
+    /**
      * Captures a single YUV_420_888 frame from the primary back camera and returns a safe heap-allocated [CopiedImageFrame].
      *
      * Ensures all native and physical resources (CameraDevice, CameraCaptureSession, ImageReader, HandlerThread)
@@ -235,6 +380,7 @@ object SingleFrameCaptureController {
         // 1. Resolve primary physical back camera
         val cameraId = resolvePrimaryCameraId(manager)
         if (diagnosticsTracker != null) {
+            diagnosticsTracker.clearAfWaitOutcome()
             diagnosticsTracker.logicalCameraId = cameraId
             diagnosticsTracker.afWaitExitReason = "NOT_RUN"
         }
@@ -244,7 +390,6 @@ object SingleFrameCaptureController {
         if (availableAutoFocusModes == null) {
             Log.w(TAG, "CONTROL_AF_AVAILABLE_MODES characteristic is null; assuming fixed-focus")
         }
-        val autoFocusMode = selectAutoFocusModeForStillCapture(availableAutoFocusModes)
         val maxRegionsAfRaw = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF)
         val maxRegionsAeRaw = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE)
         if (maxRegionsAfRaw == null) {
@@ -256,6 +401,15 @@ object SingleFrameCaptureController {
         val maxRegionsAf = maxRegionsAfRaw ?: 0
         val maxRegionsAe = maxRegionsAeRaw ?: 0
         val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val effectiveFocusPolicy = resolveEffectiveFocusTargetPolicy(
+            requestedSource = focusTarget.source,
+            maxAfRegions = maxRegionsAf,
+            activeArrayAvailable = activeArray != null
+        )
+        val autoFocusMode = selectAutoFocusModeForStillCapture(
+            availableModes = availableAutoFocusModes,
+            source = effectiveFocusPolicy.effectiveSource
+        )
 
         if (diagnosticsTracker != null) {
             diagnosticsTracker.physicalCameraIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -275,9 +429,11 @@ object SingleFrameCaptureController {
             diagnosticsTracker.availableAfModes =
                 characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toList()?.mapNotNull {
                     FocusLensDiagnosticsHelper.mapAfMode(it)
-                }
+            }
             diagnosticsTracker.selectedAfMode = FocusLensDiagnosticsHelper.mapAfMode(autoFocusMode)
-            diagnosticsTracker.focusTargetSource = "DEFAULT_CENTER"
+            diagnosticsTracker.focusTargetSource = effectiveFocusPolicy.requestedSource.name
+            diagnosticsTracker.effectiveFocusTargetSource = effectiveFocusPolicy.effectiveSource.name
+            diagnosticsTracker.focusTargetFallback = effectiveFocusPolicy.fallbackReason.name
             diagnosticsTracker.normalizedTargetX = focusTarget.x
             diagnosticsTracker.normalizedTargetY = focusTarget.y
             diagnosticsTracker.normalizedAfSize = focusTarget.afSize
@@ -286,12 +442,34 @@ object SingleFrameCaptureController {
             diagnosticsTracker.aeMaxRegions = maxRegionsAe
         }
 
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+
+        // Match the closest supported size to 1080p for single-frame stability.
+        val mappedSizes = yuvSizes.map { CaptureSize(it.width, it.height) }
+        val matchedSize = findClosestStableSize(mappedSizes)
+        val targetSize = Size(matchedSize.width, matchedSize.height)
+
         // Map normalized focus target to metering rectangles relative to active array.
-        // No crop region is queried here because no zoom control is active. When zoom
-        // is added, SCALER_CROP_REGION should be read from the device and passed to
-        // FocusMeteringCoordinateMapper.mapToActiveArray as the cropRegion parameter.
         val pureActive = activeArray?.let {
             PureRect(it.left, it.top, it.right, it.bottom)
+        }
+
+        val cropRegion = if (pureActive != null) {
+            ActiveArrayCropCalculator.calculateCenterCrop(pureActive, matchedSize)
+        } else {
+            null
+        }
+
+        if (diagnosticsTracker != null) {
+            diagnosticsTracker.meteringCropRegion = if (cropRegion != null) {
+                "Rect(${cropRegion.left}, ${cropRegion.top}, ${cropRegion.right - cropRegion.left}x${cropRegion.bottom - cropRegion.top})"
+            } else {
+                // "NONE" is currently unreachable: cropRegion is non-null whenever
+                // pureActive is non-null (see calculateCenterCrop call above).
+                // Retained for defensive coverage if crop logic changes.
+                if (activeArray == null) "NONE_ACTIVE_ARRAY_NULL" else "NONE"
+            }
         }
 
         val afRegionsToApply: Array<android.hardware.camera2.params.MeteringRectangle>? =
@@ -306,7 +484,12 @@ object SingleFrameCaptureController {
                 }
                 null
             } else {
-                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.afSize, pureActive!!)
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(
+                    target = focusTarget,
+                    size = focusTarget.afSize,
+                    activeArray = pureActive!!,
+                    cropRegion = cropRegion
+                )
                 val rect = android.hardware.camera2.params.MeteringRectangle(
                     android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
                     focusTarget.afWeight
@@ -329,7 +512,12 @@ object SingleFrameCaptureController {
                 }
                 null
             } else {
-                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(focusTarget, focusTarget.aeSize, pureActive!!)
+                val mapped = FocusMeteringCoordinateMapper.mapToActiveArray(
+                    target = focusTarget,
+                    size = focusTarget.aeSize,
+                    activeArray = pureActive!!,
+                    cropRegion = cropRegion
+                )
                 val rect = android.hardware.camera2.params.MeteringRectangle(
                     android.graphics.Rect(mapped.left, mapped.top, mapped.right, mapped.bottom),
                     focusTarget.aeWeight
@@ -339,13 +527,6 @@ object SingleFrameCaptureController {
                 }
                 arrayOf(rect)
             }
-        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
-
-        // Match the closest supported size to 1080p for single-frame stability.
-        val mappedSizes = yuvSizes.map { CaptureSize(it.width, it.height) }
-        val matchedSize = findClosestStableSize(mappedSizes)
-        val targetSize = Size(matchedSize.width, matchedSize.height)
 
         Log.d(TAG, "Selected YUV_420_888 target capture size: ${targetSize.width}x${targetSize.height}")
 
@@ -416,7 +597,7 @@ object SingleFrameCaptureController {
 
             // 5. Create CameraCaptureSession and wait for it to configure
             // TODO: Migrate to createCaptureSession(SessionConfiguration) before
-            // burst-capture task. The deprecated overload is still functional on minSdk 26.
+            // burst-capture support is added. The deprecated overload remains functional on minSdk 26.
             @Suppress("DEPRECATION")
             val configStart = tracker?.let { System.nanoTime() }
             captureSession = suspendCancellableCoroutine { cont ->
@@ -731,25 +912,46 @@ object SingleFrameCaptureController {
     ) {
         if (autoFocusMode == null) {
             Log.d(TAG, "Skipping AF lock because camera reports fixed-focus/no triggerable AF")
-            if (diagnosticsTracker != null) {
-                diagnosticsTracker.afWaitExitReason = "FIXED_FOCUS"
-            }
+            diagnosticsTracker?.publishAfWaitOutcome(
+                FocusWaitDiagnosticSample(
+                    resultAfMode = null,
+                    resultAfRegions = null,
+                    resultAeRegions = null,
+                    resultScalerCrop = null,
+                    afState = null,
+                    repeatingFrameCount = null,
+                    exitReason = "FIXED_FOCUS",
+                    afTriggerIssued = false,
+                    requestProvenance = "NONE"
+                )
+            )
             return
         }
 
         suspendCancellableCoroutine<Unit> { cont ->
             val isFocusDone = AtomicBoolean(false)
-            var frameCount = 0
+            val triggerIssued = AtomicBoolean(false)
+            val triggerSubmissionLock = Any()
+            val policy = AutoFocusWaitPolicy(autoFocusMode)
 
-            fun finishFocusWait(timedOut: Boolean, afState: Int?) {
+            fun finishFocusWait(
+                outcome: AutoFocusWaitOutcome,
+                result: android.hardware.camera2.TotalCaptureResult?,
+                requestProvenance: String,
+                failure: Throwable? = null
+            ) {
                 if (!isFocusDone.compareAndSet(false, true)) {
                     return
                 }
-                if (diagnosticsTracker != null) {
-                    diagnosticsTracker.afWaitExitState = FocusLensDiagnosticsHelper.mapAfState(afState) ?: "UNKNOWN"
-                    diagnosticsTracker.afWaitFrameCount = frameCount
-                    diagnosticsTracker.afWaitExitReason = if (timedOut) "FRAME_CAP_TIMEOUT" else "FOCUSED"
-                }
+                diagnosticsTracker?.publishAfWaitOutcome(
+                    createFocusWaitDiagnosticSample(
+                        result = result,
+                        outcome = outcome,
+                        repeatingFrameCount = policy.repeatingFrameCount,
+                        afTriggerIssued = triggerIssued.get(),
+                        requestProvenance = requestProvenance
+                    )
+                )
                 try {
                     session.stopRepeating()
                 } catch (e: Exception) {
@@ -758,14 +960,25 @@ object SingleFrameCaptureController {
                 drainImageReader(reader)
                 reader.setOnImageAvailableListener(null, null)
 
-                if (timedOut) {
-                    Log.w(TAG, "AF lock hit frame cap of $AF_LOCK_MAX_FRAMES frames (AF state=$afState)")
-                } else {
-                    Log.d(TAG, "AF lock completed successfully in $frameCount frames (AF state=$afState)")
+                when (outcome) {
+                    AutoFocusWaitOutcome.FOCUSED -> {
+                        Log.d(
+                            TAG,
+                            "AF lock completed successfully in ${policy.repeatingFrameCount} repeating frames"
+                        )
+                    }
+                    AutoFocusWaitOutcome.FRAME_CAP_TIMEOUT -> {
+                        Log.w(TAG, "AF lock hit frame cap of $AF_LOCK_MAX_FRAMES repeating frames")
+                    }
+                    else -> Log.w(TAG, "AF lock failed: $outcome", failure)
                 }
 
                 if (cont.isActive) {
-                    cont.resume(Unit)
+                    if (failure != null) {
+                        cont.resumeWithException(failure)
+                    } else {
+                        cont.resume(Unit)
+                    }
                 }
             }
 
@@ -773,18 +986,23 @@ object SingleFrameCaptureController {
                 drainImageReader(imageReaderRef)
             }, handler)
 
-            val callback = object : CameraCaptureSession.CaptureCallback() {
+            val repeatingCallback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
                     session: CameraCaptureSession,
                     request: CaptureRequest,
                     result: android.hardware.camera2.TotalCaptureResult
                 ) {
-                    frameCount++
+                    if (isFocusDone.get()) {
+                        return
+                    }
                     val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-                    if (isAutoFocusReadyForStillCapture(frameCount, afState, autoFocusMode)) {
-                        finishFocusWait(timedOut = false, afState = afState)
-                    } else if (frameCount >= AF_LOCK_MAX_FRAMES) {
-                        finishFocusWait(timedOut = true, afState = afState)
+                    val outcome = policy.onRepeatingCompleted(afState)
+                    if (outcome != null) {
+                        finishFocusWait(
+                            outcome = outcome,
+                            result = result,
+                            requestProvenance = "REPEATING"
+                        )
                     }
                 }
 
@@ -793,25 +1011,95 @@ object SingleFrameCaptureController {
                     request: CaptureRequest,
                     failure: android.hardware.camera2.CaptureFailure
                 ) {
-                    frameCount++
+                    if (isFocusDone.get()) {
+                        return
+                    }
                     Log.w(TAG, "AF lock frame failed: ${failure.reason}")
-                    if (frameCount >= AF_LOCK_MAX_FRAMES) {
-                        finishFocusWait(timedOut = true, afState = null)
+                    val outcome = policy.onRepeatingFailed()
+                    if (outcome != null) {
+                        finishFocusWait(
+                            outcome = outcome,
+                            result = null,
+                            requestProvenance = "REPEATING"
+                        )
                     }
                 }
             }
 
-            try {
-                val repeatingRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(reader.surface)
-                    set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
-                    aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
+            val triggerCallback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: android.hardware.camera2.TotalCaptureResult
+                ) {
+                    synchronized(triggerSubmissionLock) {
+                        if (!isFocusDone.get()) {
+                            policy.onTriggerCompleted()
+                        }
+                    }
                 }
-                session.setRepeatingRequest(repeatingRequest.build(), callback, handler)
 
-                if (autoFocusMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
+                override fun onCaptureFailed(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: android.hardware.camera2.CaptureFailure
+                ) {
+                    synchronized(triggerSubmissionLock) {
+                        if (isFocusDone.get()) {
+                            return
+                        }
+                        val outcome = policy.onTriggerFailed(aborted = false) ?: return
+                        finishFocusWait(
+                            outcome = outcome,
+                            result = null,
+                            requestProvenance = "TRIGGER",
+                            failure = IllegalStateException(
+                                "Autofocus trigger request failed with reason ${failure.reason}"
+                            )
+                        )
+                    }
+                }
+
+                override fun onCaptureSequenceAborted(
+                    session: CameraCaptureSession,
+                    sequenceId: Int
+                ) {
+                    synchronized(triggerSubmissionLock) {
+                        if (isFocusDone.get()) {
+                            return
+                        }
+                        val outcome = policy.onTriggerFailed(aborted = true) ?: return
+                        finishFocusWait(
+                            outcome = outcome,
+                            result = null,
+                            requestProvenance = "TRIGGER",
+                            failure = IllegalStateException("Autofocus trigger request was aborted")
+                        )
+                    }
+                }
+            }
+
+            val repeatingRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
+            }
+            try {
+                session.setRepeatingRequest(repeatingRequest.build(), repeatingCallback, handler)
+            } catch (e: Exception) {
+                if (isFocusDone.compareAndSet(false, true)) {
+                    reader.setOnImageAvailableListener(null, null)
+                    if (cont.isActive) {
+                        cont.resumeWithException(e)
+                    }
+                }
+                return@suspendCancellableCoroutine
+            }
+
+            if (shouldTriggerAutoFocus(autoFocusMode)) {
+                try {
                     val triggerRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(reader.surface)
                         set(CaptureRequest.CONTROL_AF_MODE, autoFocusMode)
@@ -820,12 +1108,17 @@ object SingleFrameCaptureController {
                         afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
                         aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
                     }
-                    session.capture(triggerRequest.build(), callback, handler)
-                }
-            } catch (e: Exception) {
-                reader.setOnImageAvailableListener(null, null)
-                if (cont.isActive) {
-                    cont.resumeWithException(e)
+                    synchronized(triggerSubmissionLock) {
+                        session.capture(triggerRequest.build(), triggerCallback, handler)
+                        triggerIssued.set(true)
+                    }
+                } catch (e: Exception) {
+                    finishFocusWait(
+                        outcome = AutoFocusWaitOutcome.TRIGGER_SUBMISSION_FAILED,
+                        result = null,
+                        requestProvenance = "TRIGGER",
+                        failure = e
+                    )
                 }
             }
 
@@ -840,6 +1133,46 @@ object SingleFrameCaptureController {
                     reader.setOnImageAvailableListener(null, null)
                 }
             }
+        }
+    }
+
+    private fun createFocusWaitDiagnosticSample(
+        result: android.hardware.camera2.TotalCaptureResult?,
+        outcome: AutoFocusWaitOutcome,
+        repeatingFrameCount: Int,
+        afTriggerIssued: Boolean,
+        requestProvenance: String
+    ): FocusWaitDiagnosticSample {
+        val rawAfRegions = result?.get(CaptureResult.CONTROL_AF_REGIONS)
+        val rawAeRegions = result?.get(CaptureResult.CONTROL_AE_REGIONS)
+        val crop = result?.get(CaptureResult.SCALER_CROP_REGION)
+        return FocusWaitDiagnosticSample(
+            resultAfMode = FocusLensDiagnosticsHelper.mapAfMode(
+                result?.get(CaptureResult.CONTROL_AF_MODE)
+            ),
+            resultAfRegions = formatMeteringRegions(rawAfRegions),
+            resultAeRegions = formatMeteringRegions(rawAeRegions),
+            resultScalerCrop = crop?.let {
+                "Rect(${it.left}, ${it.top}, ${it.width()}x${it.height()})"
+            },
+            afState = FocusLensDiagnosticsHelper.mapAfState(
+                result?.get(CaptureResult.CONTROL_AF_STATE)
+            ),
+            repeatingFrameCount = repeatingFrameCount,
+            exitReason = outcome.name,
+            afTriggerIssued = afTriggerIssued,
+            requestProvenance = requestProvenance
+        )
+    }
+
+    private fun formatMeteringRegions(
+        regions: Array<android.hardware.camera2.params.MeteringRectangle>?
+    ): String? {
+        if (regions.isNullOrEmpty()) {
+            return null
+        }
+        return regions.joinToString(", ") { region ->
+            "Rect(${region.rect.left}, ${region.rect.top}, ${region.rect.width()}x${region.rect.height()} wt=${region.meteringWeight})"
         }
     }
 
