@@ -11,9 +11,6 @@ import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -28,8 +25,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -62,13 +59,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.proshot.app.camera.CameraCapabilitiesMapper
+import com.proshot.app.camera.CameraCaptureRuntime
 import com.proshot.app.camera.CaptureCoordinator
 import com.proshot.app.camera.CaptureResult
 import com.proshot.app.camera.CaptureTiming
 import com.proshot.app.camera.CaptureTimingTracker
 import com.proshot.app.camera.FocusLensDiagnostics
 import com.proshot.app.camera.FocusLensDiagnosticsTracker
-import com.proshot.app.camera.SingleFrameCaptureController
 import com.proshot.app.camera.FocusMeteringTarget
 import com.proshot.app.camera.PreviewTapFocusMapper
 import com.proshot.app.camera.compat.CompatibilityDecision
@@ -79,12 +76,11 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "CameraScreen"
 
@@ -121,11 +117,12 @@ private enum class CameraUIState {
  * A functional, clean camera UI layer handling permissions, lifecycle-bound preview, and diagnostics.
  *
  * Capability mapping runs off the main thread on [Dispatchers.IO] to avoid blocking
- * the UI with Camera2 HAL IPC. CameraX preview binding is cancellable via
- * structured concurrency and cleaned up via [DisposableEffect].
+ * the UI with Camera2 HAL IPC. Preview attachment is delegated to the activity-owned
+ * camera runtime and cleaned up through structured effect cancellation.
  */
 @Composable
 fun CameraScreen(
+    cameraCaptureRuntime: CameraCaptureRuntime,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -212,6 +209,7 @@ fun CameraScreen(
             }
             CameraUIState.ACTIVE_PREVIEW -> {
                 ActivePreviewContent(
+                    cameraCaptureRuntime = cameraCaptureRuntime,
                     context = context,
                     lifecycleOwner = lifecycleOwner,
                     onCameraError = { message ->
@@ -225,11 +223,12 @@ fun CameraScreen(
 }
 
 /**
- * Composable containing the live CameraX preview, binding logic, and debug overlay.
- * Separated to scope the [DisposableEffect] cleanup correctly.
+ * Composable containing the live CameraX preview surface and debug overlay.
+ * Camera lifecycle mechanics remain delegated to [CameraCaptureRuntime].
  */
 @Composable
 private fun ActivePreviewContent(
+    cameraCaptureRuntime: CameraCaptureRuntime,
     context: Context,
     lifecycleOwner: androidx.lifecycle.LifecycleOwner,
     onCameraError: (String) -> Unit
@@ -239,10 +238,7 @@ private fun ActivePreviewContent(
             scaleType = PreviewView.ScaleType.FILL_CENTER
         }
     }
-    // Remembered reference to the camera provider for cleanup in DisposableEffect.
-    var cameraProvider: ProcessCameraProvider? by remember { mutableStateOf(null) }
 
-    var previewTrigger by remember { mutableIntStateOf(0) }
     var isCapturing by remember { mutableStateOf(false) }
     var captureStatusMessage by remember { mutableStateOf("") }
     var showDebugOverlay by remember { mutableStateOf(false) }
@@ -250,96 +246,39 @@ private fun ActivePreviewContent(
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     }
     val scope = rememberCoroutineScope()
+    val isPreviewReady by cameraCaptureRuntime.isPreviewReady.collectAsState()
 
     var focusTarget by remember { mutableStateOf(FocusMeteringTarget.center()) }
     var focusRingVisible by remember { mutableStateOf(false) }
     var tapPosition by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
     var tapCounter by remember { mutableIntStateOf(0) }
-    // Sensor orientation is constant for a given camera and is resolved once at
-    // setup. Using this directly (instead of resolveOutputRotationDegrees) is
-    // correct for the preview-to-sensor tap transform because sensor orientation
-    // does not change with device rotation. Default 90 covers the Nothing Phone 2
-    // back camera.
     var sensorOrientationDegrees by remember { mutableIntStateOf(90) }
 
     var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
     var lastFocusLensDiagnostics by remember { mutableStateOf<FocusLensDiagnostics?>(null) }
-    var activeTimingTracker by remember { mutableStateOf<CaptureTimingTracker?>(null) }
-    var capturePipelineStart by remember { mutableStateOf<Long?>(null) }
-    var captureRebindStart by remember { mutableStateOf<Long?>(null) }
 
-    // Resolve ProcessCameraProvider off the main thread using cancellable coroutine.
-    // This replaces the uncancellable addListener pattern.
-    LaunchedEffect(lifecycleOwner, previewView, previewTrigger) {
-        val startRebind = captureRebindStart
-        val startPipeline = capturePipelineStart
-        val activeTracker = activeTimingTracker
+    LaunchedEffect(cameraCaptureRuntime, lifecycleOwner, previewView) {
+        var attachmentGeneration: Long? = null
         try {
-            val provider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
-                val future = ProcessCameraProvider.getInstance(context)
-                // Do not register invokeOnCancellation { future.cancel(...) } here.
-                // CameraX exposes a shared provider future; cancelling it can break
-                // later provider resolution. Instead, guard inactive continuations.
-                future.addListener({
-                    if (!cont.isActive) {
-                        return@addListener
-                    }
-                    try {
-                        cont.resume(future.get())
-                    } catch (e: Exception) {
-                        if (cont.isActive) {
-                            cont.resumeWithException(e)
-                        }
-                    }
-                }, ContextCompat.getMainExecutor(context))
+            attachmentGeneration = cameraCaptureRuntime.attach(lifecycleOwner, previewView)
+            if (attachmentGeneration == null) {
+                return@LaunchedEffect
             }
-
-            cameraProvider = provider
-            provider.unbindAll()
-
-            val previewUseCase = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-            provider.bindToLifecycle(
-                lifecycleOwner,
-                cameraSelector,
-                previewUseCase
-            )
-
-            if (activeTracker != null && startRebind != null && startPipeline != null) {
-                activeTracker.previewRebindMs = (System.nanoTime() - startRebind) / 1_000_000L
-                activeTracker.totalCapturePipelineMs = (System.nanoTime() - startPipeline) / 1_000_000L
-                lastCaptureTiming = activeTracker.toCaptureTiming()
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            if (activeTracker != null && startRebind != null && startPipeline != null) {
-                activeTracker.previewRebindMs = (System.nanoTime() - startRebind) / 1_000_000L
-                activeTracker.totalCapturePipelineMs = (System.nanoTime() - startPipeline) / 1_000_000L
-                lastCaptureTiming = activeTracker.toCaptureTiming()
-            }
-            Log.e(TAG, "Failed to bind CameraX preview", e)
+            awaitCancellation()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to attach camera preview", error)
             onCameraError("Camera could not start. Please try again.")
         } finally {
-            if (activeTimingTracker != null) {
-                activeTimingTracker = null
-                capturePipelineStart = null
-                captureRebindStart = null
-            }
-        }
-    }
-
-    // Keyed on lifecycleOwner only: LaunchedEffect unbinds before every rebind.
-    // This effect is final cleanup when the preview leaves composition entirely.
-    DisposableEffect(lifecycleOwner) {
-        onDispose {
-            try {
-                cameraProvider?.unbindAll()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error unbinding CameraX on dispose", e)
+            withContext(NonCancellable) {
+                attachmentGeneration?.let { generation ->
+                    try {
+                        cameraCaptureRuntime.detach(generation)
+                    } catch (error: Exception) {
+                        Log.e(TAG, "Failed to detach camera preview", error)
+                    }
+                }
             }
         }
     }
@@ -348,9 +287,6 @@ private fun ActivePreviewContent(
         mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
     }
 
-    // Resolve capabilities and sensor orientation off the main thread to avoid
-    // blocking on Camera2 HAL IPC. Sensor orientation is constant for the back
-    // camera and is needed synchronously by the tap handler.
     LaunchedEffect(context) {
         capabilityState = withContext(Dispatchers.IO) {
             val caps = CameraCapabilitiesMapper.map(context)
@@ -359,9 +295,9 @@ private fun ActivePreviewContent(
         }
         sensorOrientationDegrees = withContext(Dispatchers.IO) {
             try {
-                SingleFrameCaptureController.resolveSensorOrientation(context)
+                cameraCaptureRuntime.resolveSensorOrientation(context)
             } catch (e: Exception) {
-                90 // Nothing Phone 2 back camera default
+                90
             }
         }
     }
@@ -374,23 +310,17 @@ private fun ActivePreviewContent(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Render live CameraX preview
         AndroidView(
             factory = { previewView },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Transparent tap overlay for focus mapping.
-        // Tap handling is fully synchronous: sensor orientation is resolved once
-        // at setup and stored in sensorOrientationDegrees. This eliminates the
-        // async race where rapid double-taps could desynchronize the visible
-        // focus ring position from the actual capture focus target.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(isCapturing) {
+                .pointerInput(isCapturing, isPreviewReady) {
                     detectTapGestures { offset ->
-                        if (!isCapturing && size.width > 0 && size.height > 0) {
+                        if (!isCapturing && isPreviewReady && size.width > 0 && size.height > 0) {
                             val target = PreviewTapFocusMapper.mapToSensorTarget(
                                 tapX = offset.x,
                                 tapY = offset.y,
@@ -408,7 +338,6 @@ private fun ActivePreviewContent(
                 }
         )
 
-        // Focus ring overlay
         if (focusRingVisible && tapPosition != null) {
             val pos = tapPosition!!
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -421,9 +350,7 @@ private fun ActivePreviewContent(
             }
         }
 
-        // Debug controls (only available in debug builds)
         if (isDebugBuild) {
-            // Tiny toggle chip in TopEnd
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -452,7 +379,6 @@ private fun ActivePreviewContent(
                 )
             }
 
-            // Debug overlay in TopStart (only if expanded)
             if (showDebugOverlay && capabilityState != null) {
                 val (capabilities, decision) = capabilityState!!
                 Box(
@@ -465,14 +391,12 @@ private fun ActivePreviewContent(
             }
         }
 
-        // Shutter and feedback container
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Auto-clear terminal status messages after 3 seconds to unclutter the viewfinder.
             if (captureStatusMessage.isNotEmpty() && !isCapturing) {
                 LaunchedEffect(captureStatusMessage) {
                     delay(3000L)
@@ -480,7 +404,6 @@ private fun ActivePreviewContent(
                 }
             }
 
-            // Styled status message pill
             if (captureStatusMessage.isNotEmpty()) {
                 Box(
                     modifier = Modifier
@@ -499,9 +422,9 @@ private fun ActivePreviewContent(
             }
 
             ShutterButton(
-                enabled = !isCapturing && cameraProvider != null && capabilityState != null,
+                enabled = !isCapturing && isPreviewReady && capabilityState != null,
                 isCapturing = isCapturing,
-                isWaiting = cameraProvider == null || capabilityState == null,
+                isWaiting = capabilityState == null || !isPreviewReady,
                 onClick = {
                     val activeDecision = capabilityState?.second ?: return@ShutterButton
                     val lookProfile = activeDecision.lookProfile
@@ -510,22 +433,9 @@ private fun ActivePreviewContent(
                     scope.launch {
                         val tracker = if (isDebugBuild) CaptureTimingTracker() else null
                         val diagnosticsTracker = if (isDebugBuild) FocusLensDiagnosticsTracker() else null
-                        val pipelineStart = if (isDebugBuild) System.nanoTime() else null
-                        activeTimingTracker = tracker
-                        capturePipelineStart = pipelineStart
 
                         try {
-                            val unbindStart = if (isDebugBuild) System.nanoTime() else null
-                            // 1. Explicitly unbind all CameraX use cases from the provider on Main thread
-                            withContext(Dispatchers.Main) {
-                                cameraProvider?.unbindAll()
-                            }
-                            if (tracker != null && unbindStart != null) {
-                                tracker.previewUnbindMs = (System.nanoTime() - unbindStart) / 1_000_000L
-                            }
-
-                            // 2. Delegate capture orchestration and background dispatch to CaptureCoordinator
-                            val result = CaptureCoordinator.executeCapture(
+                            val result = cameraCaptureRuntime.capture(
                                 context = context,
                                 lookProfile = lookProfile,
                                 isDebug = isDebugBuild,
@@ -533,11 +443,9 @@ private fun ActivePreviewContent(
                                 diagnosticsTracker = diagnosticsTracker,
                                 focusTarget = focusTarget
                             ) { status ->
-                                // Map coordinator progress to beginner-safe vocabulary.
                                 captureStatusMessage = mapStatusForDisplay(status)
                             }
 
-                            // Store timing snapshot intermediate result (without rebind yet)
                             if (tracker != null) {
                                 lastCaptureTiming = tracker.toCaptureTiming()
                             }
@@ -545,7 +453,6 @@ private fun ActivePreviewContent(
                                 lastFocusLensDiagnostics = diagnosticsTracker.snapshot()
                             }
 
-                            // 3. Map high-level result to the UI status message
                             captureStatusMessage = when (result) {
                                 is CaptureResult.Success -> result.message
                                 is CaptureResult.Failure -> result.message
@@ -555,11 +462,6 @@ private fun ActivePreviewContent(
                             throw e
                         } finally {
                             isCapturing = false
-                            if (isDebugBuild) {
-                                captureRebindStart = System.nanoTime()
-                            }
-                            // 4. Guaranteed preview rebound by incrementing reactive key
-                            previewTrigger++
                         }
                     }
                 }

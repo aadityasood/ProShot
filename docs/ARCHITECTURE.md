@@ -21,14 +21,14 @@ The sole executed image path is `IMPLEMENTED`:
 ```text
 Jetpack Compose camera screen
   -> CameraX preview
-  -> UI-owned CameraX unbind
+  -> CameraCaptureRuntime-owned CameraX unbind
   -> Camera2 single YUV_420_888 capture
   -> copied image planes on the JVM heap
   -> NV21 conversion and output-orientation rotation
   -> ProShot Natural v0 global luma and chroma LUTs
   -> JPEG compression
   -> MediaStore save (Pictures/ProShot on API 29+; default shared location on API 26-28)
-  -> UI-triggered CameraX rebind
+  -> CameraCaptureRuntime-owned CameraX rebind
 ```
 
 This is an early single-frame, CPU-based prototype. It is not currently a
@@ -36,17 +36,39 @@ temporal, RAW, linear high-bit, semantic, or native multi-frame pipeline.
 
 ## Implemented Components
 
-### CameraX Preview Ownership
+### CameraX Preview and Capture Lifecycle Ownership
 
-`CameraScreen` owns the CameraX preview lifecycle transition. Before a photo it
-unbinds CameraX use cases on the main thread. After capture completes or fails,
-the screen changes its reactive preview key so the preview binding effect runs
-again.
+`CameraCaptureRuntime` is configuration-retained and Activity-owned. Hilt keeps
+one runtime core through configuration recreation, while the owner is released
+when the logical Activity finishes rather than becoming process-global. Its
+generation-based lifecycle state machine covers detached, attaching, ready,
+capturing, rebinding, and detaching states. Initial preview attachment is
+awaited before readiness is exposed to the UI. A fail-fast coroutine mutex
+covers the complete unbind, capture/process/save, and rebind transaction; a
+concurrent request returns a stable busy result without preview, capture,
+processing, save, or rebind work.
 
-`CaptureCoordinator` does not own CameraX or receive a camera provider. It owns
-the Camera2 capture-to-save sequence after the UI unbind and before the UI
-requests rebind. This split ownership is current technical debt, not the target
-architecture.
+- `CameraXPreviewController` shares the retained Activity component and runtime
+  generation domain. It wraps `ProcessCameraProvider` resolution, binding, and
+  all-use-case unbinding on the Main thread. A replacement attachment advances
+  the shared generation before a stale pre-recreation detach can act, so that
+  detach returns without invalidating, unbinding, or clearing the replacement
+  preview. Replacement and final detach still clear lifecycle-owner, view, and
+  preview-use-case references; only the process-owned provider is cached through
+  the application context.
+- `Camera2CaptureResourceOwner` encapsulates the physical Camera2 device,
+  session, `ImageReader`, and callback thread lifecycle. Its synchronized
+  register-or-close gate closes known resources atomically and gives a pending
+  open or session callback a named 1,000 ms terminal grace period. A callback
+  delivered during that period closes its late resource; otherwise the looper
+  is terminated so a missing callback cannot retain the per-capture thread.
+  After looper termination, the app cannot act on a vendor callback that is
+  never delivered to its callback path.
+
+Compose UI (`CameraScreen`) is preview-agnostic. A structured effect requests
+attach/detach, observes readiness, and delegates shutter actions to
+`CameraCaptureRuntime`; it does not resolve or bind the CameraX provider.
+
 
 ### Camera2 Capture
 
@@ -200,7 +222,7 @@ photo. A real compatibility router and every tier-specific route are `PLANNED`.
 
 Approved `PLANNED` work includes:
 
-- Capture ownership decomposition and a persistent Camera2 session.
+- A persistent Camera2 session building on the implemented ownership seams.
 - Bounded pre-shutter frame history and ZSL evaluation.
 - Timestamp-correlated frame selection and sharpness scoring.
 - RAW or YUV burst capture, alignment, merge, and ghost rejection.
@@ -242,10 +264,10 @@ user-enabled cloud backup after publication.
 
 ## Current Technical Debt
 
-- CameraX unbind/rebind remains in the Compose screen while capture-to-save
-  orchestration is separate.
-- Each shutter action tears down CameraX preview and opens a new Camera2 session.
-- `CameraScreen` and `SingleFrameCaptureController` remain large ownership areas.
+- Each shutter action still tears down all CameraX use cases and opens a new
+  Camera2 session; there is no persistent capture session.
+- `SingleFrameCaptureController` remains a large capture-policy area despite
+  per-capture physical resource ownership moving to a dedicated owner.
 - No runtime/instrumented test covers the complete unbind, capture, and rebind
   lifecycle under interruption or memory pressure.
 - Compatibility decisions are classifications without an execution router.

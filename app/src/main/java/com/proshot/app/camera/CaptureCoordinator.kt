@@ -7,6 +7,8 @@ import com.proshot.app.output.GalleryImageSaver
 import com.proshot.app.output.GallerySaveResult
 import com.proshot.app.processing.colorscience.LookProfileNv21Processor
 import com.proshot.app.processing.style.LookProfile
+import javax.inject.Inject
+import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -52,8 +54,10 @@ fun interface StatusCallback {
  * on appropriate background dispatchers ([Dispatchers.Default] for conversion/processing,
  * [Dispatchers.IO] for file I/O).
  */
-object CaptureCoordinator {
-    private const val TAG = "CaptureCoordinator"
+@Singleton
+class CaptureCoordinator @Inject constructor(
+    private val captureController: SingleFrameCaptureController
+) {
 
     /**
      * Orchestrates the complete capture-to-save sequence.
@@ -76,7 +80,7 @@ object CaptureCoordinator {
         return try {
             statusCallback.onStatusChanged("Initiating capture...")
             val frame = withContext(Dispatchers.Default) {
-                SingleFrameCaptureController.captureSingleFrame(
+                captureController.captureSingleFrame(
                     context = context,
                     tracker = tracker,
                     diagnosticsTracker = diagnosticsTracker,
@@ -84,7 +88,7 @@ object CaptureCoordinator {
                 )
             }
             val outputRotationDegrees = withContext(Dispatchers.IO) {
-                SingleFrameCaptureController.resolveOutputRotationDegrees(context)
+                captureController.resolveOutputRotationDegrees(context)
             }
 
             statusCallback.onStatusChanged("Encoding captured frame...")
@@ -176,65 +180,6 @@ object CaptureCoordinator {
         }
     }
 
-    /**
-     * Maps the underlying MediaStore save outcomes to simplified, beginner-friendly UI results.
-     *
-     * Public visibility allows pure JVM unit testing of diagnostic paired output policies.
-     */
-    fun mapOutcome(
-        saveResult: GallerySaveResult,
-        baselineSaveResult: GallerySaveResult?,
-        isDebug: Boolean
-    ): CaptureResult {
-        return mapOutcome(
-            saveOutcome = saveResult.toSaveOutcome(),
-            baselineSaveOutcome = baselineSaveResult?.toSaveOutcome(),
-            isDebug = isDebug
-        )
-    }
-
-    internal fun mapOutcome(
-        saveOutcome: SaveOutcome,
-        baselineSaveOutcome: SaveOutcome?,
-        isDebug: Boolean
-    ): CaptureResult {
-        return if (isDebug) {
-            if (saveOutcome.isSuccess) {
-                if (baselineSaveOutcome?.isSuccess == true) {
-                    CaptureResult.Success("Saved diagnostic pair")
-                } else {
-                    val reason = baselineSaveOutcome?.userReason ?: "unknown error"
-                    CaptureResult.Success("Saved natural; baseline failed: $reason")
-                }
-            } else {
-                if (baselineSaveOutcome?.isSuccess == true) {
-                    CaptureResult.Failure("Saved baseline; natural failed: ${saveOutcome.userReason}")
-                } else {
-                    CaptureResult.Failure("Save failed: ${saveOutcome.userReason}")
-                }
-            }
-        } else {
-            if (saveOutcome.isSuccess) {
-                CaptureResult.Success("Saved to gallery")
-            } else {
-                CaptureResult.Failure("Save failed: ${saveOutcome.userReason}")
-            }
-        }
-    }
-
-    /**
-     * Maps unexpected exceptions to simplified, beginner-friendly failure results.
-     *
-     * Public visibility allows pure JVM unit testing of error policy mapping.
-     */
-    fun mapException(e: Throwable): CaptureResult {
-        return when (e) {
-            is IllegalArgumentException -> CaptureResult.Failure("Capture failed: invalid image data", e)
-            is OutOfMemoryError -> CaptureResult.Failure("Not enough memory to save photo", e)
-            else -> CaptureResult.Failure("Capture failed: system error", e)
-        }
-    }
-
     private fun mapPostBaselineException(
         e: Throwable,
         baselineSaveResult: GallerySaveResult?,
@@ -252,6 +197,76 @@ object CaptureCoordinator {
     private fun mapLoggedException(e: Throwable): CaptureResult {
         Log.e(TAG, "Capture pipeline failed", e)
         return mapException(e)
+    }
+
+    internal fun resolveSensorOrientation(context: Context): Int {
+        return captureController.resolveSensorOrientation(context)
+    }
+
+    companion object {
+        private const val TAG = "CaptureCoordinator"
+
+        /**
+         * Maps the underlying MediaStore save outcomes to simplified, beginner-friendly UI results.
+         *
+         * Public visibility allows pure JVM unit testing of diagnostic paired output policies.
+         */
+        @JvmStatic
+        fun mapOutcome(
+            saveResult: GallerySaveResult,
+            baselineSaveResult: GallerySaveResult?,
+            isDebug: Boolean
+        ): CaptureResult {
+            return mapOutcome(
+                saveOutcome = saveResult.toSaveOutcome(),
+                baselineSaveOutcome = baselineSaveResult?.toSaveOutcome(),
+                isDebug = isDebug
+            )
+        }
+
+        @JvmStatic
+        internal fun mapOutcome(
+            saveOutcome: SaveOutcome,
+            baselineSaveOutcome: SaveOutcome?,
+            isDebug: Boolean
+        ): CaptureResult {
+            return if (isDebug) {
+                if (saveOutcome.isSuccess) {
+                    if (baselineSaveOutcome?.isSuccess == true) {
+                        CaptureResult.Success("Saved diagnostic pair")
+                    } else {
+                        val reason = baselineSaveOutcome?.userReason ?: "unknown error"
+                        CaptureResult.Success("Saved natural; baseline failed: $reason")
+                    }
+                } else {
+                    if (baselineSaveOutcome?.isSuccess == true) {
+                        CaptureResult.Failure("Saved baseline; natural failed: ${saveOutcome.userReason}")
+                    } else {
+                        CaptureResult.Failure("Save failed: ${saveOutcome.userReason}")
+                    }
+                }
+            } else {
+                if (saveOutcome.isSuccess) {
+                    CaptureResult.Success("Saved to gallery")
+                } else {
+                    CaptureResult.Failure("Save failed: ${saveOutcome.userReason}")
+                }
+            }
+        }
+
+        /**
+         * Maps unexpected exceptions to simplified, beginner-friendly failure results.
+         *
+         * Public visibility allows pure JVM unit testing of error policy mapping.
+         */
+        @JvmStatic
+        fun mapException(e: Throwable): CaptureResult {
+            return when (e) {
+                is IllegalArgumentException -> CaptureResult.Failure("Capture failed: invalid image data", e)
+                is OutOfMemoryError -> CaptureResult.Failure("Not enough memory to save photo", e)
+                else -> CaptureResult.Failure("Capture failed: system error", e)
+            }
+        }
     }
 }
 
