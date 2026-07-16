@@ -160,7 +160,7 @@ Before a major release:
 
 ## Release Evidence Checklist
 
-- Build, unit tests, and lint complete under Overseer verification.
+- Build, unit tests, and lint pass before release.
 - Release build opens preview and saves a photo on the device matrix.
 - Current single-frame processing matches its documented luma and chroma
   behavior.

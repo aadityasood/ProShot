@@ -9,8 +9,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import com.proshot.app.camera.CameraCaptureRuntime
 import com.proshot.app.ui.CameraScreen
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
 private const val TAG = "MainActivity"
 
@@ -40,16 +42,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Inject
+    lateinit var cameraCaptureRuntime: CameraCaptureRuntime
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            // TODO(T22): Replace ProShotTheme with full custom theme from Theme.kt
+            // TODO: Replace ProShotTheme with the full custom app theme.
             ProShotTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    CameraScreen()
+                    CameraScreen(cameraCaptureRuntime = cameraCaptureRuntime)
                 }
             }
         }
@@ -65,7 +70,7 @@ class MainActivity : ComponentActivity() {
 /**
  * Placeholder theme wrapper for ProShot.
  *
- * TODO(T22): Replace with a custom [Theme.kt] providing:
+ * A future custom theme should provide:
  *   - Custom dark-mode color scheme (camera apps are used in dark environments)
  *   - Material You / dynamic color support
  *   - Custom typography for viewfinder overlays (zoom, exposure values)

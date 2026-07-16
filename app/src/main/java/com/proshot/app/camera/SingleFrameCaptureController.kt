@@ -14,18 +14,19 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import android.view.Surface
 import android.view.WindowManager
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
@@ -185,131 +186,109 @@ data class CapturedFrameSummary(
 /**
  * Controller that coordinates Camera2 physical resources to capture a single YUV_420_888
  * frame and safely copy it to heap memory. Runs entirely on background threads.
- *
- * TODO: Convert to Hilt-injectable class before burst-capture routing is added.
  */
-object SingleFrameCaptureController {
+@Singleton
+class SingleFrameCaptureController @Inject constructor(
+    private val resourceOwnerFactory: Camera2CaptureResourceOwnerFactory
+) {
 
-    /**
-     * Extracts plane byte array sizes from a copied heap frame and returns a formatted summary.
-     */
-    fun summarizeFrame(frame: CopiedImageFrame): CapturedFrameSummary {
-        val ySize = frame.planes.getOrNull(0)?.data?.size ?: 0
-        val uSize = frame.planes.getOrNull(1)?.data?.size ?: 0
-        val vSize = frame.planes.getOrNull(2)?.data?.size ?: 0
-        return CapturedFrameSummary(
-            width = frame.width,
-            height = frame.height,
-            timestampNs = frame.timestamp,
-            formatName = "YUV_420_888",
-            yPlaneSize = ySize,
-            uPlaneSize = uSize,
-            vPlaneSize = vSize
-        )
-    }
-
-    /**
-     * Resolves the [CaptureSize] from the provided list that is closest in area to 1920x1080.
-     * Guaranteed to return a non-null, stable fallback if the list is empty.
-     */
-    fun findClosestStableSize(sizes: List<CaptureSize>): CaptureSize {
-        val targetArea = 1920 * 1080
-        return sizes.minByOrNull { size ->
-            abs((size.width * size.height) - targetArea)
-        } ?: CaptureSize(1920, 1080)
-    }
-
-    /**
-     * Selects the autofocus mode to use for the one-shot still-capture lock sequence.
-     *
-     * Default-center capture prefers `CONTINUOUS_PICTURE` and falls back to `AUTO`.
-     * A supported user-tap target prefers `AUTO` for one deterministic trigger cycle
-     * and falls back to `CONTINUOUS_PICTURE` when `AUTO` is unavailable. Callers must
-     * resolve unsupported tap targeting to the default-center policy before invoking
-     * this selector. Returns null when neither supported active AF mode is available.
-     */
-    fun selectAutoFocusModeForStillCapture(availableModes: IntArray?, source: FocusTargetSource): Int? {
-        if (availableModes == null) {
-            return null
+    companion object {
+        /**
+         * Extracts plane byte array sizes from a copied heap frame and returns a formatted summary.
+         */
+        @JvmStatic
+        fun summarizeFrame(frame: CopiedImageFrame): CapturedFrameSummary {
+            val ySize = frame.planes.getOrNull(0)?.data?.size ?: 0
+            val uSize = frame.planes.getOrNull(1)?.data?.size ?: 0
+            val vSize = frame.planes.getOrNull(2)?.data?.size ?: 0
+            return CapturedFrameSummary(
+                width = frame.width,
+                height = frame.height,
+                timestampNs = frame.timestamp,
+                formatName = "YUV_420_888",
+                yPlaneSize = ySize,
+                uPlaneSize = uSize,
+                vPlaneSize = vSize
+            )
         }
-        val modes = availableModes.toSet()
-        return when (source) {
-            FocusTargetSource.DEFAULT_CENTER -> {
-                when {
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
-                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                    CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
-                        CaptureRequest.CONTROL_AF_MODE_AUTO
-                    else -> null
+
+        /**
+         * Resolves the [CaptureSize] from the provided list that is closest in area to 1920x1080.
+         * Guaranteed to return a non-null, stable fallback if the list is empty.
+         */
+        @JvmStatic
+        fun findClosestStableSize(sizes: List<CaptureSize>): CaptureSize {
+            val targetArea = 1920 * 1080
+            return sizes.minByOrNull { size ->
+                abs((size.width * size.height) - targetArea)
+            } ?: CaptureSize(1920, 1080)
+        }
+
+        /**
+         * Selects the autofocus mode to use for the one-shot still-capture lock sequence.
+         */
+        @JvmStatic
+        fun selectAutoFocusModeForStillCapture(availableModes: IntArray?, source: FocusTargetSource): Int? {
+            if (availableModes == null) {
+                return null
+            }
+            val modes = availableModes.toSet()
+            return when (source) {
+                FocusTargetSource.DEFAULT_CENTER -> {
+                    when {
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                        CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
+                            CaptureRequest.CONTROL_AF_MODE_AUTO
+                        else -> null
+                    }
+                }
+                FocusTargetSource.USER_TAP -> {
+                    when {
+                        CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
+                            CaptureRequest.CONTROL_AF_MODE_AUTO
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                        else -> null
+                    }
                 }
             }
-            FocusTargetSource.USER_TAP -> {
-                when {
-                    CaptureRequest.CONTROL_AF_MODE_AUTO in modes ->
-                        CaptureRequest.CONTROL_AF_MODE_AUTO
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes ->
-                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                    else -> null
+        }
+
+        /**
+         * Returns true if the selected autofocus mode requires an explicit trigger start command.
+         */
+        @JvmStatic
+        fun shouldTriggerAutoFocus(afMode: Int?): Boolean {
+            return afMode == CaptureRequest.CONTROL_AF_MODE_AUTO
+        }
+
+        /**
+         * Returns true when an AF state is safe to leave the autofocus wait loop.
+         */
+        @JvmStatic
+        fun isAutoFocusReadyForStillCapture(frameCount: Int, afState: Int?, afMode: Int?): Boolean {
+            if (afMode == null) {
+                return true
+            }
+            return when (afMode) {
+                CaptureRequest.CONTROL_AF_MODE_AUTO -> {
+                    if (frameCount < AF_TRIGGER_MIN_FRAMES) return false
+                    afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
                 }
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> {
+                    if (frameCount < AF_PASSIVE_MIN_FRAMES) return false
+                    afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+                }
+                else -> false
             }
         }
-    }
 
-    /**
-     * Returns true if the selected autofocus mode requires an explicit trigger start command.
-     */
-    fun shouldTriggerAutoFocus(afMode: Int?): Boolean {
-        return afMode == CaptureRequest.CONTROL_AF_MODE_AUTO
-    }
-
-    /**
-     * Returns true when an AF state is safe to leave the autofocus wait loop.
-     *
-     * For `CONTROL_AF_MODE_AUTO`, only `FOCUSED_LOCKED` is accepted after
-     * [AF_TRIGGER_MIN_FRAMES] (2 qualifying repeating results). The caller
-     * starts this count only after the one-shot trigger result is observed, so
-     * pre-trigger pipeline results cannot satisfy the gate.
-     *
-     * For `CONTROL_AF_MODE_CONTINUOUS_PICTURE`, `PASSIVE_FOCUSED` and
-     * `FOCUSED_LOCKED` are accepted only after [AF_PASSIVE_MIN_FRAMES]
-     * (8 frames). In a fresh Camera2 session the HAL may carry
-     * `PASSIVE_FOCUSED` from the prior CameraX lens position — a stale
-     * state that does not reflect a scan of the current scene. The higher
-     * gate ensures the HAL has run at least one real passive scan cycle.
-     * `NOT_FOCUSED_LOCKED` is rejected because no `AF_TRIGGER_START` is
-     * sent in this mode — the state should not arise, but if it does
-     * (e.g., from a prior session or OEM HAL quirk), conservatively
-     * waiting for the frame cap is safer than capturing known-failed focus.
-     *
-     * `PASSIVE_UNFOCUSED` keeps waiting in both modes for the same
-     * close-subject reason. Null AF state is never ready in active modes.
-     */
-    fun isAutoFocusReadyForStillCapture(frameCount: Int, afState: Int?, afMode: Int?): Boolean {
-        if (afMode == null) {
-            return true
-        }
-        return when (afMode) {
-            CaptureRequest.CONTROL_AF_MODE_AUTO -> {
-                if (frameCount < AF_TRIGGER_MIN_FRAMES) return false
-                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-            }
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> {
-                if (frameCount < AF_PASSIVE_MIN_FRAMES) return false
-                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
-            }
-            // Unknown active AF modes fail closed: wait for the bounded
-            // frame cap rather than silently accepting unfocused output.
-            else -> false
-        }
     }
 
     /**
      * Resolves the clockwise pixel rotation needed for saved output to match device orientation.
-     *
-     * For front cameras, this returns the correct rotation angle, but the caller must also
-     * apply a horizontal flip before encoding, as Camera2 front-camera buffers are not
-     * pre-mirrored. See Camera2 documentation on LENS_FACING_FRONT sensor orientation.
      */
     fun resolveOutputRotationDegrees(context: Context): Int {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
@@ -327,16 +306,7 @@ object SingleFrameCaptureController {
         }
     }
 
-    /**
-     * Returns the back camera's physical sensor orientation in degrees.
-     *
-     * Unlike [resolveOutputRotationDegrees], this value is constant for a given
-     * camera (it does not change with display rotation). It represents the
-     * clockwise angle by which the sensor is rotated relative to the device's
-     * natural (portrait) orientation. This is the correct input for mapping
-     * preview tap coordinates into sensor-normalized space via
-     * [PreviewTapFocusMapper].
-     */
+    /** Returns the primary back camera's physical sensor orientation in degrees. */
     fun resolveSensorOrientation(context: Context): Int {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             ?: throw IllegalStateException("CameraManager is not available")
@@ -345,15 +315,43 @@ object SingleFrameCaptureController {
             .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
     }
 
+    private fun resolvePrimaryCameraId(manager: CameraManager): String {
+        return manager.cameraIdList.firstOrNull { id ->
+            val chars = manager.getCameraCharacteristics(id)
+            chars.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
+        } ?: manager.cameraIdList.firstOrNull()
+          ?: throw IllegalStateException("No physical camera detected on this device")
+    }
+
+    private fun displayRotationDegrees(context: Context): Int {
+        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            @Suppress("DEPRECATION")
+            windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        }
+        return when (rotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
     /**
      * Captures a single YUV_420_888 frame from the primary back camera and returns a safe heap-allocated [CopiedImageFrame].
      *
-     * Ensures all native and physical resources (CameraDevice, CameraCaptureSession, ImageReader, HandlerThread)
-     * are aggressively and robustly closed upon success, failure, and cancellation.
+     * Ensures known CameraDevice, CameraCaptureSession, and ImageReader resources
+     * are closed on success, failure, and cancellation while pending callbacks use
+     * the resource owner's bounded callback-thread terminal policy.
      *
      * @throws SecurityException if [android.Manifest.permission.CAMERA] is not held by the caller.
      * @throws IllegalStateException if no camera is available or capture resources cannot be initialized.
      */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @SuppressLint("MissingPermission")
     suspend fun captureSingleFrame(
         context: Context,
         tracker: CaptureTimingTracker? = null,
@@ -465,9 +463,6 @@ object SingleFrameCaptureController {
             diagnosticsTracker.meteringCropRegion = if (cropRegion != null) {
                 "Rect(${cropRegion.left}, ${cropRegion.top}, ${cropRegion.right - cropRegion.left}x${cropRegion.bottom - cropRegion.top})"
             } else {
-                // "NONE" is currently unreachable: cropRegion is non-null whenever
-                // pureActive is non-null (see calculateCenterCrop call above).
-                // Retained for defensive coverage if crop logic changes.
                 if (activeArray == null) "NONE_ACTIVE_ARRAY_NULL" else "NONE"
             }
         }
@@ -530,132 +525,127 @@ object SingleFrameCaptureController {
 
         Log.d(TAG, "Selected YUV_420_888 target capture size: ${targetSize.width}x${targetSize.height}")
 
-        // 2. Spawn dedicated callback handler thread
-        val handlerThread = HandlerThread("SingleFrameCaptureControllerThread").apply { start() }
-        val handler = Handler(handlerThread.looper)
-
-        var cameraDevice: CameraDevice? = null
-        var captureSession: CameraCaptureSession? = null
-        var imageReader: ImageReader? = null
-        val isCompleted = AtomicBoolean(false)
-
-        // AtomicReference tracks the camera device across the callback/cancellation boundary.
-        // The invokeOnCancellation lambda cannot rely on the outer `cameraDevice` var because
-        // it may still be null when cancellation fires before onOpened delivers the device.
-        val pendingDevice = AtomicReference<CameraDevice?>(null)
-        val pendingSession = AtomicReference<CameraCaptureSession?>(null)
+        val resourceOwner = resourceOwnerFactory.create(targetSize)
+        val handler = resourceOwner.handler
 
         return try {
             // 3. Open CameraDevice asynchronously
             val openStart = tracker?.let { System.nanoTime() }
-            cameraDevice = suspendCancellableCoroutine { cont ->
-                manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        Log.d(TAG, "CameraDevice opened successfully: ${camera.id}")
-                        pendingDevice.set(camera)
-                        if (cont.isActive) {
-                            cont.resume(camera) {
-                                // Cancellation raced with resume; close the dropped resource.
-                                camera.close()
+            resourceOwner.markOpenRequested()
+
+            val cameraDevice = suspendCancellableCoroutine<CameraDevice> { cont ->
+                try {
+                    manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                        override fun onOpened(camera: CameraDevice) {
+                            Log.d(TAG, "CameraDevice opened successfully: ${camera.id}")
+                            if (resourceOwner.registerDevice(camera)) {
+                                if (cont.isActive) {
+                                    cont.resume(camera)
+                                }
+                            } else if (cont.isActive) {
+                                cont.cancel(CancellationException("Camera open cancelled"))
                             }
-                        } else {
-                            camera.close()
                         }
-                    }
 
-                    override fun onDisconnected(camera: CameraDevice) {
-                        Log.w(TAG, "CameraDevice disconnected: ${camera.id}")
-                        camera.close()
-                        if (cont.isActive) {
-                            cont.resumeWithException(IllegalStateException("Camera device was disconnected"))
+                        override fun onDisconnected(camera: CameraDevice) {
+                            Log.w(TAG, "CameraDevice disconnected: ${camera.id}")
+                            resourceOwner.registerOpenFailure(camera)
+                            if (cont.isActive) {
+                                cont.resumeWithException(
+                                    IllegalStateException("Camera device was disconnected")
+                                )
+                            }
                         }
-                    }
 
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        Log.e(TAG, "CameraDevice open error: ${camera.id}, code: $error")
-                        camera.close()
-                        if (cont.isActive) {
-                            cont.resumeWithException(RuntimeException("Failed to open camera device. Error code: $error"))
+                        override fun onError(camera: CameraDevice, error: Int) {
+                            Log.e(TAG, "CameraDevice open error: ${camera.id}, code: $error")
+                            resourceOwner.registerOpenFailure(camera)
+                            if (cont.isActive) {
+                                cont.resumeWithException(
+                                    RuntimeException(
+                                        "Failed to open camera device. Error code: $error"
+                                    )
+                                )
+                            }
                         }
+                    }, handler)
+                } catch (error: Exception) {
+                    resourceOwner.markOpenSubmissionFailed()
+                    if (cont.isActive) {
+                        cont.resumeWithException(error)
                     }
-                }, handler)
+                }
 
                 cont.invokeOnCancellation {
-                    Log.d(TAG, "Camera open cancelled, closing camera device")
-                    pendingDevice.get()?.close()
-                    // Do NOT quit the handler thread here. The Camera2 open callback
-                    // may still need the looper to deliver and close a late-opened device.
-                    // The finally block handles handlerThread.quitSafely().
+                    Log.d(TAG, "Camera open cancelled")
                 }
             }
             if (openStart != null) {
                 tracker?.cameraOpenMs = (System.nanoTime() - openStart) / 1_000_000L
             }
 
-            // 4. Initialize ImageReader
-            imageReader = ImageReader.newInstance(targetSize.width, targetSize.height, ImageFormat.YUV_420_888, 4)
-
             // 5. Create CameraCaptureSession and wait for it to configure
-            // TODO: Migrate to createCaptureSession(SessionConfiguration) before
-            // burst-capture support is added. The deprecated overload remains functional on minSdk 26.
             @Suppress("DEPRECATION")
             val configStart = tracker?.let { System.nanoTime() }
-            captureSession = suspendCancellableCoroutine { cont ->
-                val device = cameraDevice
-                if (device == null) {
-                    cont.resumeWithException(IllegalStateException("CameraDevice is null"))
-                    return@suspendCancellableCoroutine
-                }
-                val readerSurface = imageReader?.surface
+            resourceOwner.markSessionRequested()
+
+            val captureSession = suspendCancellableCoroutine<CameraCaptureSession> { cont ->
+                val readerSurface = resourceOwner.getReader()?.surface
                 if (readerSurface == null) {
+                    resourceOwner.markSessionSubmissionFailed()
                     cont.resumeWithException(IllegalStateException("ImageReader surface is null"))
                     return@suspendCancellableCoroutine
                 }
-                device.createCaptureSession(listOf(readerSurface), object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        Log.d(TAG, "CameraCaptureSession configured successfully")
-                        pendingSession.set(session)
-                        if (cont.isActive) {
-                            cont.resume(session) {
-                                // Cancellation raced with resume; close the dropped session.
-                                session.close()
+                try {
+                    cameraDevice.createCaptureSession(
+                        listOf(readerSurface),
+                        object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(session: CameraCaptureSession) {
+                                Log.d(TAG, "CameraCaptureSession configured successfully")
+                                if (resourceOwner.registerSession(session)) {
+                                    if (cont.isActive) {
+                                        cont.resume(session)
+                                    }
+                                } else if (cont.isActive) {
+                                    cont.cancel(
+                                        CancellationException("Session configuration cancelled")
+                                    )
+                                }
                             }
-                        } else {
-                            session.close()
-                        }
-                    }
 
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(TAG, "CameraCaptureSession configuration failed")
-                        session.close()
-                        if (cont.isActive) {
-                            cont.resumeWithException(RuntimeException("Failed to configure capture session"))
-                        }
+                            override fun onConfigureFailed(session: CameraCaptureSession) {
+                                Log.e(TAG, "CameraCaptureSession configuration failed")
+                                resourceOwner.registerSessionFailure(session)
+                                if (cont.isActive) {
+                                    cont.resumeWithException(
+                                        RuntimeException("Failed to configure capture session")
+                                    )
+                                }
+                            }
+                        },
+                        handler
+                    )
+                } catch (error: Exception) {
+                    resourceOwner.markSessionSubmissionFailed()
+                    if (cont.isActive) {
+                        cont.resumeWithException(error)
                     }
-                }, handler)
+                }
 
                 cont.invokeOnCancellation {
-                    Log.d(TAG, "Session configuration cancelled, closing session")
-                    pendingSession.get()?.close()
+                    Log.d(TAG, "Session configuration cancelled")
                 }
             }
             if (configStart != null) {
                 tracker?.sessionConfigMs = (System.nanoTime() - configStart) / 1_000_000L
             }
 
-            // 6. Run a short YUV drain before still capture so Camera2 AE can settle.
-            val reader = imageReader
-            val device = cameraDevice
-            val session = captureSession
-
-            if (device == null || session == null) {
-                throw IllegalStateException("Camera2 capture resources were not fully initialized")
-            }
+            val reader = resourceOwner.getReader() ?: throw IllegalStateException("ImageReader is null")
 
             val warmupStart = tracker?.let { System.nanoTime() }
             warmUpAutoExposure(
-                device = device,
-                session = session,
+                device = cameraDevice,
+                session = captureSession,
                 reader = reader,
                 handler = handler,
                 autoFocusMode = autoFocusMode,
@@ -670,8 +660,8 @@ object SingleFrameCaptureController {
             // Only time and lock autofocus if camera has a triggerable AF mode
             val afStart = if (tracker != null && autoFocusMode != null) System.nanoTime() else null
             lockAutoFocusBeforeCapture(
-                device = device,
-                session = session,
+                device = cameraDevice,
+                session = captureSession,
                 reader = reader,
                 handler = handler,
                 autoFocusMode = autoFocusMode,
@@ -684,17 +674,14 @@ object SingleFrameCaptureController {
             }
 
             val stillStart = tracker?.let { System.nanoTime() }
+            val isCompleted = AtomicBoolean(false)
             val copiedFrame = suspendCancellableCoroutine<CopiedImageFrame> { cont ->
                 reader.setOnImageAvailableListener({ imageReaderRef ->
-                    // image declared outside try so finally can always close it.
-                    // acquireLatestImage is inside try to catch IllegalStateException
-                    // if the ImageReader was closed concurrently by the timeout path.
                     var image: Image? = null
                     try {
                         image = imageReaderRef.acquireLatestImage()
                         if (image != null) {
                             Log.d(TAG, "Native frame acquired, copying immediately")
-                            // Copy must be completed before native close or resume handoff
                             val frame = CopiedImageFrame.copyFrom(image)
                             if (diagnosticsTracker != null) {
                                 diagnosticsTracker.copiedImageTimestamp = frame.timestamp
@@ -722,7 +709,7 @@ object SingleFrameCaptureController {
                     }
                 }, handler)
 
-                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                val builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 builder.addTarget(reader.surface)
                 autoFocusMode?.let { builder.set(CaptureRequest.CONTROL_AF_MODE, it) }
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -747,7 +734,7 @@ object SingleFrameCaptureController {
                     }
                 }
 
-                session.capture(builder.build(), stillCallback, handler)
+                captureSession.capture(builder.build(), stillCallback, handler)
 
                 cont.invokeOnCancellation {
                     isCompleted.set(true)
@@ -763,30 +750,7 @@ object SingleFrameCaptureController {
 
             copiedFrame
         } finally {
-            // 7. Guaranteed resource cleanup on success, failure, and cancellation
-            Log.d(TAG, "Aggressively closing physical and native capture resources")
-            try {
-                captureSession?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error closing capture session", e)
-            }
-            try {
-                cameraDevice?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error closing camera device", e)
-            }
-            try {
-                imageReader?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error closing ImageReader", e)
-            }
-            // TODO: The quitSafely() here can race with a late Camera2 onOpened callback
-            // that hasn't been delivered yet. If the looper exits before the callback runs,
-            // the late-opened CameraDevice may never receive its close(). The AtomicReference
-            // + onOpened guard handles most cases, but a truly delayed HAL delivery could be
-            // suppressed. A full fix requires a resource owner that defers looper shutdown
-            // until the open callback is confirmed delivered or timed out.
-            handlerThread.quitSafely()
+            resourceOwner.close()
         }
     }
 
@@ -1190,28 +1154,4 @@ object SingleFrameCaptureController {
         }
     }
 
-    private fun resolvePrimaryCameraId(manager: CameraManager): String {
-        return manager.cameraIdList.firstOrNull { id ->
-            val chars = manager.getCameraCharacteristics(id)
-            chars.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
-        } ?: manager.cameraIdList.firstOrNull()
-          ?: throw IllegalStateException("No physical camera detected on this device")
-    }
-
-    private fun displayRotationDegrees(context: Context): Int {
-        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            context.display?.rotation ?: Surface.ROTATION_0
-        } else {
-            @Suppress("DEPRECATION")
-            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-            @Suppress("DEPRECATION")
-            windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
-        }
-        return when (rotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-    }
 }
