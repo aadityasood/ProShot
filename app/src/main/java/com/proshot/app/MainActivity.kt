@@ -45,6 +45,46 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var cameraCaptureRuntime: CameraCaptureRuntime
 
+    private var volumeKeyEventHandler: ((android.view.KeyEvent) -> Boolean)? = null
+
+    internal fun registerVolumeKeyEventHandler(
+        handler: (android.view.KeyEvent) -> Boolean
+    ) {
+        volumeKeyEventHandler = handler
+    }
+
+    internal fun unregisterVolumeKeyEventHandler(
+        handler: (android.view.KeyEvent) -> Boolean
+    ) {
+        if (volumeKeyEventHandler === handler) {
+            volumeKeyEventHandler = null
+        }
+    }
+
+    private fun invokeEventHandler(event: android.view.KeyEvent): Boolean {
+        return try {
+            volumeKeyEventHandler?.invoke(event) == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        return if (invokeEventHandler(event)) {
+            true
+        } else {
+            super.onKeyDown(keyCode, event)
+        }
+    }
+
+    override fun onKeyUp(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        return if (invokeEventHandler(event)) {
+            true
+        } else {
+            super.onKeyUp(keyCode, event)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
