@@ -70,11 +70,23 @@ attach/detach, observes readiness, and delegates shutter actions to
 `CameraCaptureRuntime`; it does not resolve or bind the CameraX provider.
 
 
-### Camera2 Capture
+### Camera2 Capture and Session Creation
 
 `SingleFrameCaptureController` opens the primary back camera, configures an
-`ImageReader`, and captures one `YUV_420_888` frame. The current pre-capture
-order is:
+`ImageReader`, and captures one `YUV_420_888` frame. To decouple capture session
+creation, the injected one-surface `Camera2CaptureSessionCreator` contract acts
+as a test seam. On API 28+, it builds a regular session using
+`SessionConfiguration` and one `OutputConfiguration`, dispatching callbacks
+through `HandlerPosterExecutor` onto the same per-capture handler. An unavailable
+handler rejects the executor command explicitly; because Camera2 may dispatch
+callbacks asynchronously, that rejection is not guaranteed to reach the
+original submission call. The capture timeout and resource owner's bounded
+terminal policy remain the fallback when a callback cannot be delivered. On API
+26-27, the creator uses the deprecated legacy `createCaptureSession` overload.
+The pure selector and executor seams do not open a camera or claim coverage of a
+real framework session submission.
+
+The current pre-capture order is:
 
 1. AE warm-up with a minimum of 3 and maximum of 12 repeating results.
 2. AF wait/lock with a maximum of 30 repeating callbacks.
@@ -157,8 +169,11 @@ fallback reasons, and save outcomes is `PLANNED`.
 ### Hilt Bootstrap
 
 Hilt application and activity bootstrap is `IMPLEMENTED` through
-`@HiltAndroidApp` and `@AndroidEntryPoint`. Capture controllers, encoders,
-savers, and service dependencies are not yet fully injected.
+`@HiltAndroidApp` and `@AndroidEntryPoint`. Camera ownership injection is also
+`IMPLEMENTED`: the activity-retained runtime and preview controller, singleton
+single-frame capture controller, per-capture resource-owner factory, and
+singleton session-creation boundary are constructor-injected or Hilt-bound.
+Other processing and output services are not yet fully injected.
 
 ## Data Models
 
@@ -191,11 +206,11 @@ OpenCV target.
 
 | Component | Repository version source | Status | Current use |
 |:---|:---|:---|:---|
-| CameraX core, Camera2 adapter, lifecycle, and view | `1.4.0-alpha05` catalog value | `IMPLEMENTED` | Preview and lifecycle binding |
+| CameraX core, Camera2 adapter, lifecycle, and view | Stable `1.6.1` catalog value | `IMPLEMENTED` | Preview and lifecycle binding |
 | Camera2 platform API | Android platform | `IMPLEMENTED` | Still capture and pre-capture control |
 | Jetpack Compose and Material3 | Compose BOM `2024.05.00` | `IMPLEMENTED` | Camera UI and debug overlay |
-| Hilt | `2.51.1` catalog value | `IMPLEMENTED` | Application/activity bootstrap only |
-| CameraX Extensions | `1.4.0-alpha05` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no extension route |
+| Hilt | `2.51.1` catalog value | `IMPLEMENTED` | Bootstrap plus camera runtime, controller, resource-factory, and session-creator injection |
+| CameraX Extensions | `1.6.1` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no extension route |
 | TensorFlow Lite and GPU delegate | `2.16.1` catalog value | `DECLARED/CONFIGURED` | Dependencies declared; no model loading or inference |
 | MediaPipe Tasks Vision | `0.10.13` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no runtime task |
 | Coil Compose | `2.7.0` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no runtime image-loading feature |
@@ -203,8 +218,8 @@ OpenCV target.
 | Native `proshot` shared library | CMake `3.22.1`, C++17 | `DECLARED/CONFIGURED` | Library load attempt and uninvoked JNI proof method only |
 | OpenCV integration | Unused catalog value `4.9.0` | `PLANNED` | Not integrated or linked |
 
-CameraX is pre-release and requires a controlled future stable-version
-migration. Dependency removal, activation, and upgrades are not part of the
+CameraX is pinned to stable `1.6.1`. Future version upgrades require controlled
+compatibility review. Dependency removal and activation are not part of the
 current runtime architecture.
 
 ## Compatibility Policy Boundary
@@ -273,7 +288,6 @@ user-enabled cloud backup after publication.
 - Compatibility decisions are classifications without an execution router.
 - The native library is a proof only, and OpenCV is not integrated.
 - Several dependencies are declared but unused.
-- CameraX uses a pre-release catalog version.
 
 ## Pre-Release Watch Items
 
@@ -282,6 +296,6 @@ Before a production release, explicitly review:
 - The current `android:allowBackup="true"` policy and backup behavior.
 - Privacy-policy readiness for the shipped feature and permission set.
 - Image metadata controls and metadata minimization.
-- Dependency cleanup, stable-version migration, and release notes.
+- Dependency cleanup, controlled version review, and release notes.
 - Runtime instrumentation and representative device-matrix coverage.
 - Release-build behavior, permissions, shrinking, logging, and save validation.
