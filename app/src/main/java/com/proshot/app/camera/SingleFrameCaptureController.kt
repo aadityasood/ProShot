@@ -188,8 +188,9 @@ data class CapturedFrameSummary(
  * frame and safely copy it to heap memory. Runs entirely on background threads.
  */
 @Singleton
-class SingleFrameCaptureController @Inject constructor(
-    private val resourceOwnerFactory: Camera2CaptureResourceOwnerFactory
+class SingleFrameCaptureController @Inject internal constructor(
+    private val resourceOwnerFactory: Camera2CaptureResourceOwnerFactory,
+    private val sessionCreator: Camera2CaptureSessionCreator
 ) {
 
     companion object {
@@ -585,7 +586,6 @@ class SingleFrameCaptureController @Inject constructor(
             }
 
             // 5. Create CameraCaptureSession and wait for it to configure
-            @Suppress("DEPRECATION")
             val configStart = tracker?.let { System.nanoTime() }
             resourceOwner.markSessionRequested()
 
@@ -597,9 +597,10 @@ class SingleFrameCaptureController @Inject constructor(
                     return@suspendCancellableCoroutine
                 }
                 try {
-                    cameraDevice.createCaptureSession(
-                        listOf(readerSurface),
-                        object : CameraCaptureSession.StateCallback() {
+                    sessionCreator.createCaptureSession(
+                        device = cameraDevice,
+                        surface = readerSurface,
+                        callback = object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
                                 Log.d(TAG, "CameraCaptureSession configured successfully")
                                 if (resourceOwner.registerSession(session)) {
@@ -623,7 +624,7 @@ class SingleFrameCaptureController @Inject constructor(
                                 }
                             }
                         },
-                        handler
+                        handler = handler
                     )
                 } catch (error: Exception) {
                     resourceOwner.markSessionSubmissionFailed()
