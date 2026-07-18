@@ -14,28 +14,35 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
@@ -58,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.proshot.app.MainActivity
 import com.proshot.app.camera.CameraCapabilitiesMapper
 import com.proshot.app.camera.CameraCaptureRuntime
 import com.proshot.app.camera.CaptureCoordinator
@@ -257,6 +265,89 @@ private fun ActivePreviewContent(
     var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
     var lastFocusLensDiagnostics by remember { mutableStateOf<FocusLensDiagnostics?>(null) }
 
+    val hapticFeedback = LocalHapticFeedback.current
+    var gridVisible by rememberSaveable { mutableStateOf(false) }
+    var capabilityState by remember(context) {
+        mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
+    }
+
+    val onShutterPressed = {
+        val activeDecision = capabilityState?.second
+        val isReady = !isCapturing && isPreviewReady && activeDecision != null
+        if (isReady) {
+            isCapturing = true
+            captureStatusMessage = "Taking photo..."
+            try {
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+            } catch (_: Exception) {
+                // Haptic availability must not prevent an accepted capture.
+            }
+            val lookProfile = activeDecision!!.lookProfile
+            scope.launch {
+                val tracker = if (isDebugBuild) CaptureTimingTracker() else null
+                val diagnosticsTracker = if (isDebugBuild) FocusLensDiagnosticsTracker() else null
+
+                try {
+                    val result = cameraCaptureRuntime.capture(
+                        context = context,
+                        lookProfile = lookProfile,
+                        isDebug = isDebugBuild,
+                        tracker = tracker,
+                        diagnosticsTracker = diagnosticsTracker,
+                        focusTarget = focusTarget
+                    ) { status ->
+                        captureStatusMessage = mapStatusForDisplay(status)
+                    }
+
+                    if (tracker != null) {
+                        lastCaptureTiming = tracker.toCaptureTiming()
+                    }
+                    if (diagnosticsTracker != null) {
+                        lastFocusLensDiagnostics = diagnosticsTracker.snapshot()
+                    }
+
+                    captureStatusMessage = when (result) {
+                        is CaptureResult.Success -> result.message
+                        is CaptureResult.Failure -> result.message
+                    }
+                } catch (e: CancellationException) {
+                    captureStatusMessage = "Capture cancelled."
+                    throw e
+                } finally {
+                    isCapturing = false
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    val currentOnShutterPressed by rememberUpdatedState(onShutterPressed)
+    val router = remember {
+        VolumeKeyRouter { currentOnShutterPressed() }
+    }
+
+    val activity = LocalContext.current as? MainActivity
+    DisposableEffect(activity, router) {
+        val installedHandler = activity?.let {
+            val handler: (android.view.KeyEvent) -> Boolean = { event ->
+                router.dispatchKeyEvent(
+                    keyCode = event.keyCode,
+                    action = event.action,
+                    repeatCount = event.repeatCount
+                )
+            }
+            it.registerVolumeKeyEventHandler(handler)
+            handler
+        }
+        onDispose {
+            if (activity != null && installedHandler != null) {
+                activity.unregisterVolumeKeyEventHandler(installedHandler)
+            }
+        }
+    }
+
     LaunchedEffect(cameraCaptureRuntime, lifecycleOwner, previewView) {
         var attachmentGeneration: Long? = null
         try {
@@ -283,10 +374,6 @@ private fun ActivePreviewContent(
         }
     }
 
-    var capabilityState by remember(context) {
-        mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
-    }
-
     LaunchedEffect(context) {
         capabilityState = withContext(Dispatchers.IO) {
             val caps = CameraCapabilitiesMapper.map(context)
@@ -309,11 +396,17 @@ private fun ActivePreviewContent(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val placement = CapturePlacementPolicy.resolve(constraints.maxWidth, constraints.maxHeight)
+
         AndroidView(
             factory = { previewView },
             modifier = Modifier.fillMaxSize()
         )
+
+        if (gridVisible) {
+            RuleOfThirdsGrid()
+        }
 
         Box(
             modifier = Modifier
@@ -394,7 +487,7 @@ private fun ActivePreviewContent(
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 32.dp),
+                .padding(bottom = 120.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (captureStatusMessage.isNotEmpty() && !isCapturing) {
@@ -418,55 +511,27 @@ private fun ActivePreviewContent(
                         textAlign = TextAlign.Center
                     )
                 }
-                Spacer(modifier = Modifier.height(16.dp))
             }
-
-            ShutterButton(
-                enabled = !isCapturing && isPreviewReady && capabilityState != null,
-                isCapturing = isCapturing,
-                isWaiting = capabilityState == null || !isPreviewReady,
-                onClick = {
-                    val activeDecision = capabilityState?.second ?: return@ShutterButton
-                    val lookProfile = activeDecision.lookProfile
-                    isCapturing = true
-                    captureStatusMessage = "Taking photo..."
-                    scope.launch {
-                        val tracker = if (isDebugBuild) CaptureTimingTracker() else null
-                        val diagnosticsTracker = if (isDebugBuild) FocusLensDiagnosticsTracker() else null
-
-                        try {
-                            val result = cameraCaptureRuntime.capture(
-                                context = context,
-                                lookProfile = lookProfile,
-                                isDebug = isDebugBuild,
-                                tracker = tracker,
-                                diagnosticsTracker = diagnosticsTracker,
-                                focusTarget = focusTarget
-                            ) { status ->
-                                captureStatusMessage = mapStatusForDisplay(status)
-                            }
-
-                            if (tracker != null) {
-                                lastCaptureTiming = tracker.toCaptureTiming()
-                            }
-                            if (diagnosticsTracker != null) {
-                                lastFocusLensDiagnostics = diagnosticsTracker.snapshot()
-                            }
-
-                            captureStatusMessage = when (result) {
-                                is CaptureResult.Success -> result.message
-                                is CaptureResult.Failure -> result.message
-                            }
-                        } catch (e: CancellationException) {
-                            captureStatusMessage = "Capture cancelled."
-                            throw e
-                        } finally {
-                            isCapturing = false
-                        }
-                    }
-                }
-            )
         }
+
+        BeginnerCameraControls(
+            isCapturing = isCapturing,
+            isWaiting = capabilityState == null || !isPreviewReady,
+            enabled = !isCapturing && isPreviewReady && capabilityState != null,
+            gridVisible = gridVisible,
+            onGridToggle = { gridVisible = !gridVisible },
+            onShutterClick = { onShutterPressed() },
+            placement = placement,
+            modifier = Modifier
+                .align(
+                    if (placement == CaptureControlsPlacement.PORTRAIT) {
+                        Alignment.BottomCenter
+                    } else {
+                        Alignment.CenterEnd
+                    }
+                )
+                .safeDrawingPadding()
+        )
     }
 }
 
@@ -476,7 +541,7 @@ private fun ActivePreviewContent(
  * and a disabled/waiting state.
  */
 @Composable
-private fun ShutterButton(
+internal fun ShutterButton(
     enabled: Boolean,
     isCapturing: Boolean,
     isWaiting: Boolean,
