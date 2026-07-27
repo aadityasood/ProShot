@@ -8,21 +8,54 @@ import org.junit.Test
 class BeginnerCameraControlsTest {
 
     @Test
-    fun placementPolicy_withPortraitDimensions_selectsPortrait() {
-        val placement = CapturePlacementPolicy.resolve(width = 1080, height = 1920)
-        assertEquals(CaptureControlsPlacement.PORTRAIT, placement)
+    fun placementPolicy_withPortraitDimensions_selectsPortraitBottom_forEveryRotation() {
+        val rotations = listOf(0, 90, 180, 270, -1, 999)
+        for (rotation in rotations) {
+            val placement = CapturePlacementPolicy.resolve(width = 1080, height = 1920, displayRotationDegrees = rotation)
+            assertEquals(CaptureControlsPlacement.PORTRAIT_BOTTOM, placement)
+        }
     }
 
     @Test
-    fun placementPolicy_withLandscapeDimensions_selectsLandscape() {
+    fun placementPolicy_withSquareDimensions_selectsPortraitBottom() {
+        val placement = CapturePlacementPolicy.resolve(width = 1080, height = 1080, displayRotationDegrees = 90)
+        assertEquals(CaptureControlsPlacement.PORTRAIT_BOTTOM, placement)
+    }
+
+    @Test
+    fun placementPolicy_withLandscapeAnd90Degrees_selectsLandscapeRight() {
+        val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080, displayRotationDegrees = 90)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_RIGHT, placement)
+    }
+
+    @Test
+    fun placementPolicy_withLandscapeAnd270Degrees_selectsLandscapeLeft() {
+        val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080, displayRotationDegrees = 270)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_LEFT, placement)
+    }
+
+    @Test
+    fun placementPolicy_withLandscapeAndNatural0Degrees_selectsLandscapeRight() {
+        val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080, displayRotationDegrees = 0)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_RIGHT, placement)
+    }
+
+    @Test
+    fun placementPolicy_withLandscapeAnd180Degrees_selectsLandscapeRight() {
+        val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080, displayRotationDegrees = 180)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_RIGHT, placement)
+    }
+
+    @Test
+    fun placementPolicy_withLandscapeAndUnavailableRotation_usesDefaultLandscapeRight() {
         val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080)
-        assertEquals(CaptureControlsPlacement.LANDSCAPE, placement)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_RIGHT, placement)
     }
 
     @Test
-    fun placementPolicy_withSquareDimensions_selectsPortraitFallback() {
-        val placement = CapturePlacementPolicy.resolve(width = 1080, height = 1080)
-        assertEquals(CaptureControlsPlacement.PORTRAIT, placement)
+    fun placementPolicy_withLandscapeAndUnknownRotation_selectsLandscapeRight() {
+        val placement = CapturePlacementPolicy.resolve(width = 1920, height = 1080, displayRotationDegrees = 999)
+        assertEquals(CaptureControlsPlacement.LANDSCAPE_RIGHT, placement)
     }
 
     @Test
