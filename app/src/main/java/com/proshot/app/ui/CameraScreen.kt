@@ -3,11 +3,8 @@ package com.proshot.app.ui
 import android.Manifest
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -66,6 +63,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.proshot.app.MainActivity
+import com.proshot.app.R
 import com.proshot.app.camera.CameraCapabilitiesMapper
 import com.proshot.app.camera.CameraCaptureRuntime
 import com.proshot.app.camera.CaptureCoordinator
@@ -138,6 +136,7 @@ fun CameraScreen(
 
     var uiState by remember { mutableStateOf(CameraUIState.CHECKING_PERMISSION) }
     var errorMessage by remember { mutableStateOf("") }
+    var showManualRecoveryMessage by remember { mutableStateOf(false) }
     var retryCount by remember { mutableIntStateOf(0) }
 
     // Launcher to request runtime camera permission
@@ -199,12 +198,11 @@ fun CameraScreen(
             CameraUIState.PERMISSION_PERMANENTLY_DENIED -> {
                 PermissionPermanentlyDeniedView(
                     onOpenSettingsClick = {
-                        val intent = Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", context.packageName, null)
-                        )
-                        context.startActivity(intent)
-                    }
+                        val navigator = AppSettingsNavigator(ContextIntentLauncher(context))
+                        val result = navigator.navigateToSettings(context.packageName)
+                        showManualRecoveryMessage = shouldShowManualRecoveryMessage(result)
+                    },
+                    showManualRecoveryMessage = showManualRecoveryMessage
                 )
             }
             CameraUIState.CAMERA_ERROR -> {
@@ -740,7 +738,8 @@ private fun PermissionDeniedView(
  */
 @Composable
 private fun PermissionPermanentlyDeniedView(
-    onOpenSettingsClick: () -> Unit
+    onOpenSettingsClick: () -> Unit,
+    showManualRecoveryMessage: Boolean
 ) {
     Box(
         modifier = Modifier
@@ -764,6 +763,15 @@ private fun PermissionPermanentlyDeniedView(
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center
             )
+            if (showManualRecoveryMessage) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = LocalContext.current.getString(R.string.manual_recovery_guide),
+                    color = Color.Gray,
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
             Spacer(modifier = Modifier.height(24.dp))
             Button(onClick = onOpenSettingsClick) {
                 Text(text = "Open Settings")

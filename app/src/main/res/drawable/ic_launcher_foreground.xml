@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Camera Body -->
+    <path
+        android:fillColor="@color/ic_launcher_foreground"
+        android:pathData="M34,39h6c1,0 2,-1 2.5,-2l2,-3c0.5,-1 1.5,-2 2.5,-2h14c1,0 2,1 2.5,2l2,3c0.5,1 1.5,2 2.5,2h6c3.3,0 6,2.7 6,6v24c0,3.3 -2.7,6 -6,6h-42c-3.3,0 -6,-2.7 -6,-6v-24c0,-3.3 2.7,-6 6,-6z" />
+    <!-- Lens Outer Ring -->
+    <path
+        android:fillColor="@color/ic_launcher_background"
+        android:pathData="M54,44c7.7,0 14,6.3 14,14c0,7.7 -6.3,14 -14,14c-7.7,0 -14,-6.3 -14,-14c0,-7.7 6.3,-14 14,-14z" />
+    <!-- Lens Inner Glass -->
+    <path
+        android:fillColor="@color/ic_launcher_foreground"
+        android:pathData="M54,49c4.9,0 9,4.1 9,9c0,4.9 -4.1,9 -9,9c-4.9,0 -9,-4.1 -9,-9c0,-4.9 4.1,-9 9,-9z" />
+</vector>

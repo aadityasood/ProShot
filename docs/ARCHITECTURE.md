@@ -287,6 +287,14 @@ It does not declare gallery-read, location, or `INTERNET` permission. Normal
 saving is local through MediaStore; this does not control gallery access or
 user-enabled cloud backup after publication.
 
+Permission recovery settings links (`IMPLEMENTED`) use a Kotlin-only destination policy and an Android intent-launch edge:
+- **Standard Routing:** Prefers launching Settings `ACTION_APPLICATION_DETAILS_SETTINGS` targeting `package:com.proshot.app` directly.
+- **Robust Fallback:** If the Android launch edge catches `ActivityNotFoundException` or `SecurityException` for the primary route, the policy tries Settings `ACTION_APPLICATION_SETTINGS`. Other exceptions and fatal errors propagate.
+- **Manual Guidance:** If both settings actions are unavailable, the UI renders clear manual recovery instructions while keeping `Open Settings` available for retry. A later successful retry clears the unavailable guidance.
+- **Adaptive Icon Compatibility:** The application icon leverages a size-bearing 108 x 108 dp adaptive vector foreground resource (`ic_launcher_foreground.xml`) representing a camera glyph, ensuring compatibility with Android system settings panels.
+
+This repair does not change camera execution, pre-capture gates, LUT processing, NV21 translation, or photo output.
+
 ## Current Technical Debt
 
 - Each shutter action still tears down all CameraX use cases and opens a new
