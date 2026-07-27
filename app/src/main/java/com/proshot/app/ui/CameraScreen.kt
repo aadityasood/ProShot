@@ -5,7 +5,13 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Display
+import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
@@ -38,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.AbsoluteAlignment
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.animation.core.animateDpAsState
@@ -89,6 +96,121 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val TAG = "CameraScreen"
+
+internal data class CurrentDisplayRotation(
+    val displayId: Int,
+    val rotationDegrees: Int
+)
+
+internal fun interface DisplayRotationSubscription {
+    fun dispose()
+}
+
+internal interface DisplayRotationSource {
+    fun currentDisplayRotation(): CurrentDisplayRotation?
+
+    fun observeDisplayChanges(
+        onDisplayChanged: (displayId: Int) -> Unit
+    ): DisplayRotationSubscription
+}
+
+private object UnavailableDisplayRotationSource : DisplayRotationSource {
+    override fun currentDisplayRotation(): CurrentDisplayRotation? = null
+
+    override fun observeDisplayChanges(
+        onDisplayChanged: (displayId: Int) -> Unit
+    ): DisplayRotationSubscription = DisplayRotationSubscription {}
+}
+
+private class AndroidDisplayRotationSource(
+    private val activity: Activity,
+    private val displayManager: DisplayManager,
+    private val mainHandler: Handler = Handler(Looper.getMainLooper())
+) : DisplayRotationSource {
+    override fun currentDisplayRotation(): CurrentDisplayRotation? {
+        val display = currentActivityDisplay() ?: return null
+        return CurrentDisplayRotation(
+            displayId = display.displayId,
+            rotationDegrees = display.rotation.toNeutralRotationDegrees()
+        )
+    }
+
+    override fun observeDisplayChanges(
+        onDisplayEvent: (displayId: Int) -> Unit
+    ): DisplayRotationSubscription {
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {
+                onDisplayEvent(displayId)
+            }
+
+            override fun onDisplayRemoved(displayId: Int) {
+                onDisplayEvent(displayId)
+            }
+
+            override fun onDisplayChanged(displayId: Int) {
+                onDisplayEvent(displayId)
+            }
+        }
+        displayManager.registerDisplayListener(listener, mainHandler)
+        return DisplayRotationSubscription {
+            displayManager.unregisterDisplayListener(listener)
+        }
+    }
+
+    private fun currentActivityDisplay(): Display? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            activity.display
+        } else {
+            @Suppress("DEPRECATION")
+            activity.windowManager.defaultDisplay
+        }
+    }
+
+    private fun Int.toNeutralRotationDegrees(): Int {
+        return when (this) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_270 -> 270
+            Surface.ROTATION_180 -> 180
+            else -> 0
+        }
+    }
+}
+
+@Composable
+internal fun rememberCurrentDisplayRotationDegrees(
+    source: DisplayRotationSource
+): Int {
+    var rotationDegrees by remember(source) {
+        mutableIntStateOf(source.currentDisplayRotation()?.rotationDegrees ?: 0)
+    }
+
+    DisposableEffect(source) {
+        var observedDisplayId = source.currentDisplayRotation()?.displayId
+        val subscription = source.observeDisplayChanges { changedDisplayId ->
+            val current = source.currentDisplayRotation()
+            when {
+                current != null && current.displayId == changedDisplayId -> {
+                    observedDisplayId = current.displayId
+                    rotationDegrees = current.rotationDegrees
+                }
+                current == null && observedDisplayId == changedDisplayId -> {
+                    observedDisplayId = null
+                    rotationDegrees = 0
+                }
+            }
+        }
+
+        val current = source.currentDisplayRotation()
+        observedDisplayId = current?.displayId
+        rotationDegrees = current?.rotationDegrees ?: 0
+
+        onDispose {
+            subscription.dispose()
+        }
+    }
+
+    return rotationDegrees
+}
 
 /**
  * Maps coordinator progress strings to beginner-safe UI vocabulary.
@@ -268,6 +390,16 @@ private fun ActivePreviewContent(
     var capabilityState by remember(context) {
         mutableStateOf<Pair<DeviceCameraCapabilities, CompatibilityDecision>?>(null)
     }
+    val displayRotationSource = remember(context) {
+        val activity = context as? Activity
+        val displayManager = activity?.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        if (activity != null && displayManager != null) {
+            AndroidDisplayRotationSource(activity, displayManager)
+        } else {
+            UnavailableDisplayRotationSource
+        }
+    }
+    val displayRotation = rememberCurrentDisplayRotationDegrees(displayRotationSource)
 
     val onShutterPressed = {
         val activeDecision = capabilityState?.second
@@ -395,7 +527,11 @@ private fun ActivePreviewContent(
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val placement = CapturePlacementPolicy.resolve(constraints.maxWidth, constraints.maxHeight)
+        val placement = CapturePlacementPolicy.resolve(
+            width = constraints.maxWidth,
+            height = constraints.maxHeight,
+            displayRotationDegrees = displayRotation
+        )
 
         AndroidView(
             factory = { previewView },
@@ -512,6 +648,12 @@ private fun ActivePreviewContent(
             }
         }
 
+        val alignment = when (placement) {
+            CaptureControlsPlacement.PORTRAIT_BOTTOM -> Alignment.BottomCenter
+            CaptureControlsPlacement.LANDSCAPE_LEFT -> AbsoluteAlignment.CenterLeft
+            CaptureControlsPlacement.LANDSCAPE_RIGHT -> AbsoluteAlignment.CenterRight
+        }
+
         BeginnerCameraControls(
             isCapturing = isCapturing,
             isWaiting = capabilityState == null || !isPreviewReady,
@@ -521,13 +663,7 @@ private fun ActivePreviewContent(
             onShutterClick = { onShutterPressed() },
             placement = placement,
             modifier = Modifier
-                .align(
-                    if (placement == CaptureControlsPlacement.PORTRAIT) {
-                        Alignment.BottomCenter
-                    } else {
-                        Alignment.CenterEnd
-                    }
-                )
+                .align(alignment)
                 .safeDrawingPadding()
         )
     }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -31,23 +32,28 @@ import com.proshot.app.R
  * Placement configuration for the capture control strip.
  */
 internal enum class CaptureControlsPlacement {
-    PORTRAIT,
-    LANDSCAPE
+    PORTRAIT_BOTTOM,
+    LANDSCAPE_LEFT,
+    LANDSCAPE_RIGHT
 }
 
 /**
- * Pure placement policy to determine controls alignment based on window dimensions.
- * Portrait/Square aligns to bottom center; Landscape aligns to center end.
+ * Pure placement policy to determine controls alignment based on window dimensions and display rotation.
+ * Portrait/Square aligns to bottom center; Landscape maps rotation 270 to physical left,
+ * rotation 90 to physical right, and 0/180/ambiguous values fall back to physical right.
  */
 internal object CapturePlacementPolicy {
     /**
-     * Resolves the placement configuration based on window width and height.
+     * Resolves the placement configuration based on window width, height, and display rotation degrees.
      */
-    fun resolve(width: Int, height: Int): CaptureControlsPlacement {
-        return if (width > height) {
-            CaptureControlsPlacement.LANDSCAPE
-        } else {
-            CaptureControlsPlacement.PORTRAIT
+    fun resolve(width: Int, height: Int, displayRotationDegrees: Int = 0): CaptureControlsPlacement {
+        if (width <= height) {
+            return CaptureControlsPlacement.PORTRAIT_BOTTOM
+        }
+        return when (displayRotationDegrees) {
+            270 -> CaptureControlsPlacement.LANDSCAPE_LEFT
+            90 -> CaptureControlsPlacement.LANDSCAPE_RIGHT
+            else -> CaptureControlsPlacement.LANDSCAPE_RIGHT
         }
     }
 }
@@ -195,7 +201,7 @@ internal fun BeginnerCameraControls(
     placement: CaptureControlsPlacement,
     modifier: Modifier = Modifier
 ) {
-    if (placement == CaptureControlsPlacement.PORTRAIT) {
+    if (placement == CaptureControlsPlacement.PORTRAIT_BOTTOM) {
         Row(
             modifier = modifier
                 .fillMaxWidth()
@@ -214,10 +220,16 @@ internal fun BeginnerCameraControls(
             Spacer(modifier = Modifier.size(48.dp))
         }
     } else {
+        val isLeft = placement == CaptureControlsPlacement.LANDSCAPE_LEFT
         Column(
             modifier = modifier
                 .fillMaxHeight()
-                .padding(end = 32.dp, top = 24.dp, bottom = 24.dp),
+                .absolutePadding(
+                    left = if (isLeft) 32.dp else 0.dp,
+                    right = if (!isLeft) 32.dp else 0.dp,
+                    top = 24.dp,
+                    bottom = 24.dp
+                ),
             verticalArrangement = Arrangement.SpaceEvenly,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
