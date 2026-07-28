@@ -132,6 +132,16 @@ and pre-release watch items.
 
 ## License
 
-No open-source license has been selected. Public visibility does not grant
-reuse, distribution, or modification rights beyond what GitHub permits for
-viewing the repository.
+Copyright (C) 2026 Aaditya Sood.
+
+ProShot is free software licensed under the GNU General Public License,
+version 3 only (`GPL-3.0-only`). See [`LICENSE`](LICENSE) for the complete
+terms.
+
+The license applies to ProShot-owned source code and documentation. Third-party
+components remain under their respective licenses. The GPL does not grant
+permission to use the ProShot or ProShot Natural names, project logos, or other
+brand identifiers as trademarks or to imply endorsement by the project.
+
+Separate commercial licensing may be available from the copyright holder for
+uses that require different terms.
