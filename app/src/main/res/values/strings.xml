@@ -3,5 +3,6 @@
     <string name="grid_toggle_desc">Toggle composition grid</string>
     <string name="grid_state_on">Grid is on</string>
     <string name="grid_state_off">Grid is off</string>
+    <string name="taking_photo">Taking photo...</string>
     <string name="manual_recovery_guide">Settings link is unavailable. Please open device Settings -> Apps -> ProShot to enable the Camera permission manually.</string>
 </resources>

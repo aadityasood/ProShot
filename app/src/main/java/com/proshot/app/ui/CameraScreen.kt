@@ -73,7 +73,6 @@ import com.proshot.app.MainActivity
 import com.proshot.app.R
 import com.proshot.app.camera.CameraCapabilitiesMapper
 import com.proshot.app.camera.CameraCaptureRuntime
-import com.proshot.app.camera.CaptureCoordinator
 import com.proshot.app.camera.CaptureResult
 import com.proshot.app.camera.CaptureTiming
 import com.proshot.app.camera.CaptureTimingTracker
@@ -92,6 +91,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -210,24 +210,6 @@ internal fun rememberCurrentDisplayRotationDegrees(
     }
 
     return rotationDegrees
-}
-
-/**
- * Maps coordinator progress strings to beginner-safe UI vocabulary.
- *
- * The [CaptureCoordinator] emits pipeline-specific status strings (e.g. "Encoding
- * captured frame...") that are useful for diagnostics but too technical for the main
- * status pill. This function translates them to simple camera-app language.
- */
-private fun mapStatusForDisplay(coordinatorStatus: String): String {
-    return when (coordinatorStatus) {
-        "Initiating capture..." -> "Taking photo..."
-        "Encoding captured frame..." -> "Taking photo..."
-        "Saving baseline photo..." -> "Saving photo..."
-        "Processing photo..." -> "Processing photo..."
-        "Saving to gallery..." -> "Saving photo..."
-        else -> "Working..."
-    }
 }
 
 /**
@@ -368,7 +350,9 @@ private fun ActivePreviewContent(
     }
 
     var isCapturing by remember { mutableStateOf(false) }
-    var captureStatusMessage by remember { mutableStateOf("") }
+    val feedbackReducer = remember { CaptureFeedbackReducer() }
+    var captureFeedbackState by remember { mutableStateOf<CaptureFeedbackState>(CaptureFeedbackState.Hidden()) }
+    var focusStatusMessage by remember { mutableStateOf("") }
     var showDebugOverlay by remember { mutableStateOf(false) }
     val isDebugBuild = remember(context) {
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -406,7 +390,9 @@ private fun ActivePreviewContent(
         val isReady = !isCapturing && isPreviewReady && activeDecision != null
         if (isReady) {
             isCapturing = true
-            captureStatusMessage = "Taking photo..."
+            focusStatusMessage = ""
+            val takingPhotoText = context.getString(R.string.taking_photo)
+            captureFeedbackState = feedbackReducer.startCapture(takingPhotoText)
             try {
                 hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
             } catch (_: Exception) {
@@ -425,8 +411,8 @@ private fun ActivePreviewContent(
                         tracker = tracker,
                         diagnosticsTracker = diagnosticsTracker,
                         focusTarget = focusTarget
-                    ) { status ->
-                        captureStatusMessage = mapStatusForDisplay(status)
+                    ) { _ ->
+                        // Continue supplying coordinator status callback without updating beginner status pill
                     }
 
                     if (tracker != null) {
@@ -436,12 +422,15 @@ private fun ActivePreviewContent(
                         lastFocusLensDiagnostics = diagnosticsTracker.snapshot()
                     }
 
-                    captureStatusMessage = when (result) {
+                    val message = when (result) {
                         is CaptureResult.Success -> result.message
                         is CaptureResult.Failure -> result.message
                     }
+                    captureFeedbackState = feedbackReducer.completeCapture(message)
                 } catch (e: CancellationException) {
-                    captureStatusMessage = "Capture cancelled."
+                    if (isActive) {
+                        captureFeedbackState = feedbackReducer.completeCapture("Capture cancelled.")
+                    }
                     throw e
                 } finally {
                     isCapturing = false
@@ -559,7 +548,7 @@ private fun ActivePreviewContent(
                             tapPosition = offset
                             focusRingVisible = true
                             focusTarget = target
-                            captureStatusMessage = "Focus set"
+                            focusStatusMessage = "Focus set"
                         }
                     }
                 }
@@ -618,35 +607,20 @@ private fun ActivePreviewContent(
             }
         }
 
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 120.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (captureStatusMessage.isNotEmpty() && !isCapturing) {
-                LaunchedEffect(captureStatusMessage) {
-                    delay(3000L)
-                    captureStatusMessage = ""
-                }
-            }
-
-            if (captureStatusMessage.isNotEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .background(Color.Black.copy(alpha = 0.7f), shape = RoundedCornerShape(16.dp))
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = captureStatusMessage,
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        textAlign = TextAlign.Center
-                    )
-                }
+        if (focusStatusMessage.isNotEmpty()) {
+            LaunchedEffect(tapCounter) {
+                delay(3000L)
+                focusStatusMessage = ""
             }
         }
+
+        CaptureFeedbackPlacement(
+            state = captureFeedbackState,
+            focusMessage = focusStatusMessage,
+            onDismiss = { eventToken ->
+                captureFeedbackState = feedbackReducer.dismiss(eventToken)
+            }
+        )
 
         val alignment = when (placement) {
             CaptureControlsPlacement.PORTRAIT_BOTTOM -> Alignment.BottomCenter
