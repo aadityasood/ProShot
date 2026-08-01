@@ -6,28 +6,17 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.view.Display
-import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -47,13 +36,9 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.AbsoluteAlignment
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.Role
@@ -63,7 +48,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -96,121 +80,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val TAG = "CameraScreen"
-
-internal data class CurrentDisplayRotation(
-    val displayId: Int,
-    val rotationDegrees: Int
-)
-
-internal fun interface DisplayRotationSubscription {
-    fun dispose()
-}
-
-internal interface DisplayRotationSource {
-    fun currentDisplayRotation(): CurrentDisplayRotation?
-
-    fun observeDisplayChanges(
-        onDisplayChanged: (displayId: Int) -> Unit
-    ): DisplayRotationSubscription
-}
-
-private object UnavailableDisplayRotationSource : DisplayRotationSource {
-    override fun currentDisplayRotation(): CurrentDisplayRotation? = null
-
-    override fun observeDisplayChanges(
-        onDisplayChanged: (displayId: Int) -> Unit
-    ): DisplayRotationSubscription = DisplayRotationSubscription {}
-}
-
-private class AndroidDisplayRotationSource(
-    private val activity: Activity,
-    private val displayManager: DisplayManager,
-    private val mainHandler: Handler = Handler(Looper.getMainLooper())
-) : DisplayRotationSource {
-    override fun currentDisplayRotation(): CurrentDisplayRotation? {
-        val display = currentActivityDisplay() ?: return null
-        return CurrentDisplayRotation(
-            displayId = display.displayId,
-            rotationDegrees = display.rotation.toNeutralRotationDegrees()
-        )
-    }
-
-    override fun observeDisplayChanges(
-        onDisplayEvent: (displayId: Int) -> Unit
-    ): DisplayRotationSubscription {
-        val listener = object : DisplayManager.DisplayListener {
-            override fun onDisplayAdded(displayId: Int) {
-                onDisplayEvent(displayId)
-            }
-
-            override fun onDisplayRemoved(displayId: Int) {
-                onDisplayEvent(displayId)
-            }
-
-            override fun onDisplayChanged(displayId: Int) {
-                onDisplayEvent(displayId)
-            }
-        }
-        displayManager.registerDisplayListener(listener, mainHandler)
-        return DisplayRotationSubscription {
-            displayManager.unregisterDisplayListener(listener)
-        }
-    }
-
-    private fun currentActivityDisplay(): Display? {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            activity.display
-        } else {
-            @Suppress("DEPRECATION")
-            activity.windowManager.defaultDisplay
-        }
-    }
-
-    private fun Int.toNeutralRotationDegrees(): Int {
-        return when (this) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_270 -> 270
-            Surface.ROTATION_180 -> 180
-            else -> 0
-        }
-    }
-}
-
-@Composable
-internal fun rememberCurrentDisplayRotationDegrees(
-    source: DisplayRotationSource
-): Int {
-    var rotationDegrees by remember(source) {
-        mutableIntStateOf(source.currentDisplayRotation()?.rotationDegrees ?: 0)
-    }
-
-    DisposableEffect(source) {
-        var observedDisplayId = source.currentDisplayRotation()?.displayId
-        val subscription = source.observeDisplayChanges { changedDisplayId ->
-            val current = source.currentDisplayRotation()
-            when {
-                current != null && current.displayId == changedDisplayId -> {
-                    observedDisplayId = current.displayId
-                    rotationDegrees = current.rotationDegrees
-                }
-                current == null && observedDisplayId == changedDisplayId -> {
-                    observedDisplayId = null
-                    rotationDegrees = 0
-                }
-            }
-        }
-
-        val current = source.currentDisplayRotation()
-        observedDisplayId = current?.displayId
-        rotationDegrees = current?.rotationDegrees ?: 0
-
-        onDispose {
-            subscription.dispose()
-        }
-    }
-
-    return rotationDegrees
-}
 
 /**
  * States for the camera permissions and preview workflow state machine.
@@ -640,286 +509,5 @@ private fun ActivePreviewContent(
                 .align(alignment)
                 .safeDrawingPadding()
         )
-    }
-}
-
-/**
- * A camera-style circular shutter control.
- * Displays a capturing state with shrinking circle size and an active progress indicator,
- * and a disabled/waiting state.
- */
-@Composable
-internal fun ShutterButton(
-    enabled: Boolean,
-    isCapturing: Boolean,
-    isWaiting: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val innerSize by animateDpAsState(
-        targetValue = when {
-            isWaiting -> 0.dp
-            isCapturing -> 44.dp
-            else -> 60.dp
-        },
-        label = "shutterInnerSize"
-    )
-
-    Box(
-        modifier = modifier
-            .size(84.dp)
-            .semantics {
-                role = Role.Button
-                contentDescription = when {
-                    isWaiting -> "Camera loading"
-                    isCapturing -> "Capturing photo"
-                    else -> "Take photo"
-                }
-                stateDescription = when {
-                    isWaiting -> "Waiting"
-                    isCapturing -> "Capturing"
-                    enabled -> "Ready"
-                    else -> "Disabled"
-                }
-            }
-            .clickable(
-                enabled = enabled && !isWaiting && !isCapturing,
-                onClick = onClick
-            ),
-        contentAlignment = Alignment.Center
-    ) {
-        // Outer Ring
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawCircle(
-                color = Color.White.copy(alpha = if (isWaiting) 0.3f else 1.0f),
-                radius = (size.minDimension / 2) - 4.dp.toPx(),
-                style = Stroke(width = 4.dp.toPx())
-            )
-        }
-
-        if (isWaiting || isCapturing) {
-            CircularProgressIndicator(
-                color = Color.White,
-                strokeWidth = 3.dp,
-                modifier = Modifier.size(52.dp)
-            )
-        }
-
-        if (innerSize > 0.dp) {
-            Box(
-                modifier = Modifier
-                    .size(innerSize)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = if (enabled) 1.0f else 0.5f))
-            )
-        }
-    }
-}
-
-/**
- * Temporary debug overlay displaying pipeline tier and device capability diagnostics.
- */
-@Composable
-private fun DebugStatusOverlay(
-    capabilities: DeviceCameraCapabilities,
-    decision: CompatibilityDecision,
-    lastCaptureTiming: CaptureTiming?,
-    lastFocusLensDiagnostics: FocusLensDiagnostics?
-) {
-    Column(
-        modifier = Modifier
-            .background(Color.Black.copy(alpha = 0.75f), shape = RoundedCornerShape(12.dp))
-            .padding(12.dp)
-    ) {
-        Text(
-            text = "ProShot Debug Status",
-            color = Color.Green,
-            fontSize = 12.sp,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = "Pipeline Tier: ${decision.tier}",
-            color = Color.White,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = "Look Profile: ${decision.lookProfile.displayName}",
-            color = Color.White,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = "HW Level: ${capabilities.hardwareLevel}",
-            color = Color.White,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = "GPU: ${if (capabilities.gpuDelegateSupported) "OK" else "CPU fallback"}",
-            color = if (capabilities.gpuDelegateSupported) Color.Cyan else Color.Yellow,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = "Masks: ${if (capabilities.semanticMasksSupported) "OK" else "Disabled"}",
-            color = if (capabilities.semanticMasksSupported) Color.Cyan else Color.Yellow,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        if (lastCaptureTiming != null) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = lastCaptureTiming.formatDiagnostics(),
-                color = Color.Green,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace
-            )
-        }
-        if (lastFocusLensDiagnostics != null) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = lastFocusLensDiagnostics.formatDiagnostics(),
-                color = Color.Green,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace
-            )
-        }
-    }
-}
-
-@Composable
-private fun LoadingStateView() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                text = "Initializing camera...",
-                color = Color.LightGray,
-                fontSize = 14.sp
-            )
-        }
-    }
-}
-
-@Composable
-private fun PermissionDeniedView(
-    onGrantClick: () -> Unit
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = "Camera Permission Required",
-                color = Color.White,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "ProShot needs camera permission to capture photos.",
-                color = Color.Gray,
-                fontSize = 14.sp,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(24.dp))
-            Button(onClick = onGrantClick) {
-                Text(text = "Grant Permission")
-            }
-        }
-    }
-}
-
-/**
- * Shown when the user has permanently denied the camera permission (e.g. "Don't ask again"
- * on Android 11+). Offers a deep-link to the app's system Settings page so the user can
- * manually re-enable the permission.
- */
-@Composable
-private fun PermissionPermanentlyDeniedView(
-    onOpenSettingsClick: () -> Unit,
-    showManualRecoveryMessage: Boolean
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = "Camera Permission Required",
-                color = Color.White,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "Camera permission has been permanently denied. " +
-                    "Please enable it in your device settings to use ProShot.",
-                color = Color.Gray,
-                fontSize = 14.sp,
-                textAlign = TextAlign.Center
-            )
-            if (showManualRecoveryMessage) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = LocalContext.current.getString(R.string.manual_recovery_guide),
-                    color = Color.Gray,
-                    fontSize = 14.sp,
-                    textAlign = TextAlign.Center
-                )
-            }
-            Spacer(modifier = Modifier.height(24.dp))
-            Button(onClick = onOpenSettingsClick) {
-                Text(text = "Open Settings")
-            }
-        }
-    }
-}
-
-@Composable
-private fun CameraErrorView(
-    message: String,
-    onRetryClick: () -> Unit
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = "Camera Initialization Error",
-                color = Color.Red,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = message,
-                color = Color.Gray,
-                fontSize = 14.sp,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(24.dp))
-            Button(onClick = onRetryClick) {
-                Text(text = "Retry")
-            }
-        }
     }
 }
