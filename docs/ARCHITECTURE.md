@@ -101,7 +101,8 @@ The current pre-capture order is:
 
 1. AE warm-up with a minimum of 3 and maximum of 12 repeating results.
 2. AF wait/lock with a maximum of 30 repeating callbacks.
-3. One still capture and immediate copied-plane copy.
+3. A session-ready boundary after the AE/AF request stream, followed by one final FIFO `ImageReader` drain before the still correlator is installed.
+4. One still capture requiring exact matching between `TotalCaptureResult.SENSOR_TIMESTAMP` and `Image.timestamp` via FIFO `acquireNextImage()` acquisition and a bounded per-request correlator before copied-plane memory transfer.
 
 Default-center focus prefers `CONTINUOUS_PICTURE` and falls back to `AUTO`.
 A user tap with a supported AF region prefers `AUTO`; unsupported tap targeting

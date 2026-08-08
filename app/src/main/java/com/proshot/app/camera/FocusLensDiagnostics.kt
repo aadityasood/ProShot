@@ -252,13 +252,12 @@ object FocusLensDiagnosticsHelper {
  * Mutable tracker used during capture to gather focus and lens diagnostics.
  *
  * Scalar fields are marked `@Volatile` because the tracker is written on the
- * camera handler thread and read after the capture pipeline returns. Two kinds
- * of callbacks can legitimately arrive late: the still-capture result may
- * arrive after the image callback resumes its coroutine, and queued AF trigger
- * or repeating callbacks may arrive after the AF continuation resumes or is
- * cancelled. The still timestamp therefore remains nullable. AF outcome data
- * is instead published as one immutable sample through an [AtomicReference];
- * the first terminal callback wins and later callbacks cannot replace it.
+ * camera handler thread and read after the capture pipeline returns. A successful
+ * capture return waits for exact total capture result and image timestamp
+ * correlation before returning; queued AF trigger or repeating callbacks may still
+ * arrive late after focus continuation completes. AF outcome data is published as
+ * one immutable sample through an [AtomicReference]; the first terminal callback
+ * wins and later callbacks cannot replace it.
  */
 class FocusLensDiagnosticsTracker {
     private val afWaitDiagnosticSample = AtomicReference<FocusWaitDiagnosticSample?>(null)
@@ -287,10 +286,9 @@ class FocusLensDiagnosticsTracker {
     @Volatile var afWaitExitReason: String? = null
     /**
      * Sensor timestamp from the still capture's `onCaptureCompleted` callback.
-     * This callback may fire after `onImageAvailable` on some HALs (common on
-     * Qualcomm), so this field may still be null at `snapshot()` time. When
-     * null, the timestamp match diagnostic shows `UNAVAILABLE`. This is a
-     * known diagnostic limitation, not a capture correctness issue.
+     * Correlated directly with [copiedImageTimestamp] via exact timestamp matching.
+     * For a successful capture return, both timestamps are populated and guaranteed
+     * to match exactly.
      */
     @Volatile var stillCaptureResultTimestamp: Long? = null
     @Volatile var copiedImageTimestamp: Long? = null
