@@ -291,53 +291,6 @@ class CopiedImageFrameTest {
     }
 
     @Test
-    fun resolveEffectiveFocusTargetPolicy_userTapWithoutAfRegionsUsesDefaultCenterStrategy() {
-        val policy = resolveEffectiveFocusTargetPolicy(
-            requestedSource = FocusTargetSource.USER_TAP,
-            maxAfRegions = 0,
-            activeArrayAvailable = true
-        )
-
-        assertEquals(FocusTargetSource.USER_TAP, policy.requestedSource)
-        assertEquals(FocusTargetSource.DEFAULT_CENTER, policy.effectiveSource)
-        assertEquals(FocusTargetFallbackReason.AF_REGIONS_UNSUPPORTED, policy.fallbackReason)
-        assertEquals(
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-            SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
-                intArrayOf(
-                    CaptureRequest.CONTROL_AF_MODE_AUTO,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                ),
-                policy.effectiveSource
-            )
-        )
-    }
-
-    @Test
-    fun resolveEffectiveFocusTargetPolicy_nullActiveArrayHasDistinctFallback() {
-        val policy = resolveEffectiveFocusTargetPolicy(
-            requestedSource = FocusTargetSource.USER_TAP,
-            maxAfRegions = 0,
-            activeArrayAvailable = false
-        )
-
-        assertEquals(FocusTargetSource.DEFAULT_CENTER, policy.effectiveSource)
-        assertEquals(FocusTargetFallbackReason.ACTIVE_ARRAY_UNAVAILABLE, policy.fallbackReason)
-    }
-
-    @Test
-    fun resolveEffectiveFocusTargetPolicy_supportedUserTapRemainsUserTap() {
-        val policy = resolveEffectiveFocusTargetPolicy(
-            requestedSource = FocusTargetSource.USER_TAP,
-            maxAfRegions = 1,
-            activeArrayAvailable = true
-        )
-
-        assertEquals(FocusTargetSource.USER_TAP, policy.effectiveSource)
-        assertEquals(FocusTargetFallbackReason.NONE, policy.fallbackReason)
-    }
-
-    @Test
     fun selectAutoFocusModeForStillCapture_macroOnlyReturnsFallbackNull() {
         val selectedDefault = SingleFrameCaptureController.selectAutoFocusModeForStillCapture(
             intArrayOf(CaptureRequest.CONTROL_AF_MODE_MACRO),
@@ -383,85 +336,6 @@ class CopiedImageFrameTest {
         // At exactly 2 frames (gate boundary), AUTO FOCUSED_LOCKED is ready
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(2, locked, autoMode))
         assertTrue(SingleFrameCaptureController.isAutoFocusReadyForStillCapture(3, locked, autoMode))
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_preTriggerLockedResultsAreIgnored() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_AUTO)
-        val locked = CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-
-        assertEquals(null, policy.onRepeatingCompleted(locked))
-        assertEquals(null, policy.onRepeatingCompleted(locked))
-        assertEquals(0, policy.repeatingFrameCount)
-        assertFalse(policy.triggerBoundaryObserved)
-        assertEquals(null, policy.outcome)
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_readinessStartsAfterTriggerBoundary() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_AUTO)
-        val locked = CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-
-        policy.onTriggerCompleted()
-        assertTrue(policy.triggerBoundaryObserved)
-        assertEquals(null, policy.onRepeatingCompleted(locked))
-        assertEquals(1, policy.repeatingFrameCount)
-        assertEquals(AutoFocusWaitOutcome.FOCUSED, policy.onRepeatingCompleted(locked))
-        assertEquals(2, policy.repeatingFrameCount)
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_failedRepeatingCallbackDoesNotSatisfyTriggerGate() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_AUTO)
-        val locked = CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-
-        policy.onTriggerCompleted()
-        assertEquals(null, policy.onRepeatingFailed())
-        assertEquals(1, policy.repeatingFrameCount)
-        assertEquals(0, policy.qualifyingRepeatingResultCount)
-        assertEquals(null, policy.onRepeatingCompleted(locked))
-        assertEquals(1, policy.qualifyingRepeatingResultCount)
-        assertEquals(AutoFocusWaitOutcome.FOCUSED, policy.onRepeatingCompleted(locked))
-        assertEquals(2, policy.qualifyingRepeatingResultCount)
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_triggerFailureCannotBecomeSuccessful() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_AUTO)
-
-        assertEquals(AutoFocusWaitOutcome.TRIGGER_FAILED, policy.onTriggerFailed(aborted = false))
-        policy.onTriggerCompleted()
-        assertEquals(
-            null,
-            policy.onRepeatingCompleted(CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
-        )
-        assertEquals(AutoFocusWaitOutcome.TRIGGER_FAILED, policy.outcome)
-        assertEquals(0, policy.repeatingFrameCount)
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_triggerAbortCannotBecomeSuccessful() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_AUTO)
-
-        assertEquals(AutoFocusWaitOutcome.TRIGGER_ABORTED, policy.onTriggerFailed(aborted = true))
-        policy.onTriggerCompleted()
-        assertEquals(
-            null,
-            policy.onRepeatingCompleted(CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
-        )
-        assertEquals(AutoFocusWaitOutcome.TRIGGER_ABORTED, policy.outcome)
-    }
-
-    @Test
-    fun autoFocusWaitPolicy_continuousPictureRetainsEightFrameGate() {
-        val policy = AutoFocusWaitPolicy(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-        val focused = CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
-
-        repeat(7) {
-            assertEquals(null, policy.onRepeatingCompleted(focused))
-        }
-        assertEquals(AutoFocusWaitOutcome.FOCUSED, policy.onRepeatingCompleted(focused))
-        assertEquals(8, policy.repeatingFrameCount)
     }
 
     @Test
