@@ -49,8 +49,11 @@ pipeline.
 `CameraCaptureRuntime` is configuration-retained and Activity-owned. Hilt keeps
 one runtime core and one stable `previewReady` `StateFlow` through configuration
 recreation, while the owner is released when the logical Activity finishes rather
-than becoming process-global. Its generation-based lifecycle state machine covers
-detached, attaching, ready, capturing, rebinding, and detaching states.
+than becoming process-global. `CameraCaptureRuntimeCore.kt` owns the testable
+coroutine generation/capture state machine, while `CameraCaptureRuntime.kt`
+retains the Activity-retained Android/Hilt facade. Its generation-based
+lifecycle state machine covers detached, attaching, ready, capturing,
+rebinding, and detaching states.
 Route policy (`CameraOwnershipRoutePolicy`) selects `PERSISTENT_CAMERA2` for
 debuggable builds and `CAMERA_X_HANDOFF` for release builds. For the persistent direct
 Camera2 route, capture executes `Ready -> Capturing -> Ready` with zero unbind/rebind
@@ -97,8 +100,11 @@ default non-uniform stretch, uses uniform center-crop fill, and rotates only by
 negative display rotation because TextureView already compensates sensor
 orientation. A separate raw-buffer-to-view affine transform is retained only for
 inverse tap-focus mapping and is never passed to `TextureView.setTransform()`.
-This debuggable-only direct geometry remains provisional and device-unverified
-until the corrected physical orientation smoke and targeted connected test pass.
+This debuggable-only direct geometry passed the production-host instrumentation
+path, the complete 31-test connected suite, and owner-reported
+portrait/landscape/tap/capture physical smoke on one Nothing Phone (2) running
+Android 16. It remains provisional across untested API levels, hardware
+classes, and vendors.
 
 ### Beginner Capture Surface and Input
 
@@ -219,10 +225,11 @@ fallback reasons, and save outcomes is `PLANNED`.
 
 Hilt application and activity bootstrap is `IMPLEMENTED` through
 `@HiltAndroidApp` and `@AndroidEntryPoint`. Camera ownership injection is also
-`IMPLEMENTED`: the activity-retained runtime and preview controller, singleton
-single-frame capture controller, per-capture resource-owner factory, and
-singleton session-creation boundary are constructor-injected or Hilt-bound.
-Other processing and output services are not yet fully injected.
+`IMPLEMENTED`: the Activity-retained runtime and preview controllers (CameraX
+handoff and direct Camera2), the singleton capture coordinator and
+single-frame capture controller, unscoped per-capture resource-owner factories,
+and the singleton session-creation boundary are constructor-injected or
+Hilt-bound. Other processing and output services are not yet fully injected.
 
 ## Data Models
 
@@ -257,8 +264,8 @@ OpenCV target.
 |:---|:---|:---|:---|
 | CameraX core, Camera2 adapter, lifecycle, and view | Stable `1.6.1` catalog value | `IMPLEMENTED` | Preview and lifecycle binding |
 | Camera2 platform API | Android platform | `IMPLEMENTED` | Still capture and pre-capture control |
-| Jetpack Compose and Material3 | Compose BOM `2024.05.00` | `IMPLEMENTED` | Camera UI and debug overlay |
-| Hilt | `2.51.1` catalog value | `IMPLEMENTED` | Bootstrap plus camera runtime, controller, resource-factory, and session-creator injection |
+| Jetpack Compose and Material3 | Compose BOM `2025.08.00` | `IMPLEMENTED` | Camera UI and debug overlay |
+| Hilt | `2.54` catalog value | `IMPLEMENTED` | Bootstrap plus camera runtime, controller, resource-factory, and session-creator injection |
 | CameraX Extensions | `1.6.1` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no extension route |
 | TensorFlow Lite and GPU delegate | `2.16.1` catalog value | `DECLARED/CONFIGURED` | Dependencies declared; no model loading or inference |
 | MediaPipe Tasks Vision | `0.10.13` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no runtime task |
@@ -338,8 +345,10 @@ This repair does not change camera execution, pre-capture gates, LUT processing,
 ## Current Technical Debt
 
 - Release builds still tear down CameraX use cases and open one rollback Camera2
-  session per shutter. Debuggable builds use the provisional persistent Camera2
-  route, whose physical-device compatibility remains unverified.
+  session per shutter. The debuggable direct Camera2 route remains provisional:
+  it is verified on only one device (a Nothing Phone (2) running Android 16)
+  and is not validated across other API levels, hardware classes, or vendors,
+  so release builds remain on CameraX.
 - `SingleFrameCaptureController` remains a large capture-policy area despite
   per-capture physical resource ownership moving to a dedicated owner.
 - No runtime/instrumented test covers the complete unbind, capture, and rebind
