@@ -76,4 +76,24 @@ class Camera2CaptureSessionCreatorTest {
         assertEquals(1, postCount)
         assertEquals(0, executionCount)
     }
+
+    @Test
+    fun sessionOutputValidator_validatesEmptyOneAndTwoOrderedSurfaces() {
+        var emptyCheckFailed = false
+        try {
+            SessionOutputValidator.validateOutputs(emptyList<String>())
+        } catch (e: IllegalArgumentException) {
+            emptyCheckFailed = true
+        }
+        assertTrue(emptyCheckFailed)
+
+        val oneSurface = SessionOutputValidator.validateOutputs(listOf("preview"))
+        assertEquals(1, oneSurface.size)
+        assertEquals("preview", oneSurface[0])
+
+        val twoSurfaces = SessionOutputValidator.validateOutputs(listOf("preview", "still"))
+        assertEquals(2, twoSurfaces.size)
+        assertEquals("preview", twoSurfaces[0])
+        assertEquals("still", twoSurfaces[1])
+    }
 }

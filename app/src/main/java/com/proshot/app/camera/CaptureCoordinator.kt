@@ -63,6 +63,7 @@ class CaptureCoordinator @Inject constructor(
      * Orchestrates the complete capture-to-save sequence.
      *
      * @param context The application or activity context.
+     * @param frameSource The generation-bound rollback or direct Camera2 frame source.
      * @param lookProfile The active color/tone [LookProfile] to apply.
      * @param isDebug Policy flag determining if paired baseline diagnostics are saved.
      * @param statusCallback Progress listener receiving beginner-friendly pipeline updates.
@@ -70,6 +71,7 @@ class CaptureCoordinator @Inject constructor(
      */
     suspend fun executeCapture(
         context: Context,
+        frameSource: CameraFrameSource = captureController,
         lookProfile: LookProfile,
         isDebug: Boolean,
         tracker: CaptureTimingTracker? = null,
@@ -80,7 +82,7 @@ class CaptureCoordinator @Inject constructor(
         return try {
             statusCallback.onStatusChanged("Initiating capture...")
             val frame = withContext(Dispatchers.Default) {
-                captureController.captureSingleFrame(
+                frameSource.captureFrame(
                     context = context,
                     tracker = tracker,
                     diagnosticsTracker = diagnosticsTracker,
@@ -88,7 +90,7 @@ class CaptureCoordinator @Inject constructor(
                 )
             }
             val outputRotationDegrees = withContext(Dispatchers.IO) {
-                captureController.resolveOutputRotationDegrees(context)
+                frameSource.resolveOutputRotationDegrees(context)
             }
 
             statusCallback.onStatusChanged("Encoding captured frame...")
