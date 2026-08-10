@@ -10,10 +10,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
-import android.media.Image
-import android.media.ImageReader
 import android.os.Build
-import android.os.Handler
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -22,36 +19,17 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 
 private const val TAG = "SingleFrameCaptureController"
 private const val CAPTURE_TIMEOUT_MS = 8_000L
-private const val AE_WARMUP_MIN_FRAMES = 3
-private const val AE_WARMUP_MAX_FRAMES = 12
-
-// Minimum qualifying repeating results after the AUTO trigger result has
-// established a causal boundary before FOCUSED_LOCKED is accepted.
 private const val AF_TRIGGER_MIN_FRAMES = 2
-
-// Minimum callbacks before PASSIVE_FOCUSED or FOCUSED_LOCKED is accepted
-// in CONTINUOUS_PICTURE mode. In a fresh Camera2 session the HAL may carry
-// PASSIVE_FOCUSED from the prior CameraX session's lens position. A gate
-// of 8 frames (~267 ms at 30 fps) exceeds the typical Qualcomm CDAF scan
-// initialization window and ensures the HAL has run at least one real scan
-// cycle on the current scene before the result is trusted.
 private const val AF_PASSIVE_MIN_FRAMES = 8
-
-private data class TimestampCorrelatedCopiedFrame(
-    val frame: CopiedImageFrame,
-    val resultTimestamp: Long
-)
 
 /**
  * Represent standard image dimension in a pure Kotlin format to enable robust
@@ -88,7 +66,16 @@ data class CapturedFrameSummary(
 class SingleFrameCaptureController @Inject internal constructor(
     private val resourceOwnerFactory: Camera2CaptureResourceOwnerFactory,
     private val sessionCreator: Camera2CaptureSessionCreator
-) {
+) : CameraFrameSource {
+
+    override suspend fun captureFrame(
+        context: Context,
+        tracker: CaptureTimingTracker?,
+        diagnosticsTracker: FocusLensDiagnosticsTracker?,
+        focusTarget: FocusMeteringTarget
+    ): CopiedImageFrame {
+        return captureSingleFrame(context, tracker, diagnosticsTracker, focusTarget)
+    }
 
     companion object {
         /**
@@ -188,7 +175,7 @@ class SingleFrameCaptureController @Inject internal constructor(
     /**
      * Resolves the clockwise pixel rotation needed for saved output to match device orientation.
      */
-    fun resolveOutputRotationDegrees(context: Context): Int {
+    override fun resolveOutputRotationDegrees(context: Context): Int {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             ?: throw IllegalStateException("CameraManager is not available")
         val cameraId = resolvePrimaryCameraId(manager)
@@ -205,7 +192,7 @@ class SingleFrameCaptureController @Inject internal constructor(
     }
 
     /** Returns the primary back camera's physical sensor orientation in degrees. */
-    fun resolveSensorOrientation(context: Context): Int {
+    override fun resolveSensorOrientation(context: Context): Int {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
             ?: throw IllegalStateException("CameraManager is not available")
         val cameraId = resolvePrimaryCameraId(manager)
@@ -248,7 +235,6 @@ class SingleFrameCaptureController @Inject internal constructor(
      * @throws SecurityException if [android.Manifest.permission.CAMERA] is not held by the caller.
      * @throws IllegalStateException if no camera is available or capture resources cannot be initialized.
      */
-    @OptIn(ExperimentalCoroutinesApi::class)
     @SuppressLint("MissingPermission")
     suspend fun captureSingleFrame(
         context: Context,
@@ -261,7 +247,6 @@ class SingleFrameCaptureController @Inject internal constructor(
         }
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     @SuppressLint("MissingPermission")
     private suspend fun captureSingleFrameOnCurrentThread(
         context: Context,
@@ -425,8 +410,14 @@ class SingleFrameCaptureController @Inject internal constructor(
 
         val resourceOwner = resourceOwnerFactory.create(targetSize)
         val handler = resourceOwner.handler
+        val reader = resourceOwner.getReader() ?: run {
+            resourceOwner.close()
+            throw IllegalStateException("ImageReader is null")
+        }
+        val imageRouter = Camera2ImageReaderRouter()
 
         return try {
+            reader.setOnImageAvailableListener(imageRouter, handler)
             // 3. Open CameraDevice asynchronously
             val openStart = tracker?.let { System.nanoTime() }
             resourceOwner.markOpenRequested()
@@ -488,16 +479,11 @@ class SingleFrameCaptureController @Inject internal constructor(
             val sessionReadyGate = CameraSessionReadyGate()
 
             val captureSession = suspendCancellableCoroutine<CameraCaptureSession> { cont ->
-                val readerSurface = resourceOwner.getReader()?.surface
-                if (readerSurface == null) {
-                    resourceOwner.markSessionSubmissionFailed()
-                    cont.resumeWithException(IllegalStateException("ImageReader surface is null"))
-                    return@suspendCancellableCoroutine
-                }
+                val readerSurface = reader.surface
                 try {
                     sessionCreator.createCaptureSession(
                         device = cameraDevice,
-                        surface = readerSurface,
+                        surfaces = listOf(readerSurface),
                         callback = object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
                                 Log.d(TAG, "CameraCaptureSession configured successfully")
@@ -523,11 +509,11 @@ class SingleFrameCaptureController @Inject internal constructor(
                             }
 
                             override fun onActive(session: CameraCaptureSession) {
-                                sessionReadyGate.onActive()
+                                imageRouter.onSessionActive()
                             }
 
                             override fun onReady(session: CameraCaptureSession) {
-                                sessionReadyGate.onReady()
+                                imageRouter.onSessionReady()
                             }
                         },
                         handler = handler
@@ -547,783 +533,33 @@ class SingleFrameCaptureController @Inject internal constructor(
                 tracker?.sessionConfigMs = (System.nanoTime() - configStart) / 1_000_000L
             }
 
-            val reader = resourceOwner.getReader() ?: throw IllegalStateException("ImageReader is null")
-
-            val warmupStart = tracker?.let { System.nanoTime() }
-            warmUpAutoExposure(
+            val engine = Camera2StillCaptureEngine(
                 device = cameraDevice,
                 session = captureSession,
-                reader = reader,
                 handler = handler,
-                autoFocusMode = autoFocusMode,
-                diagnosticsTracker = diagnosticsTracker,
-                afRegions = afRegionsToApply,
-                aeRegions = aeRegionsToApply
+                characteristics = characteristics,
+                selectedSize = Size(targetSize.width, targetSize.height),
+                repeatingSurface = reader.surface,
+                stillSurface = reader.surface,
+                imageReader = reader,
+                imageRouter = imageRouter,
+                submissionGate = AlwaysOpenCamera2RequestSubmissionGate
             )
-            if (warmupStart != null) {
-                tracker?.aeWarmupMs = (System.nanoTime() - warmupStart) / 1_000_000L
-            }
 
-            // Only time and lock autofocus if camera has a triggerable AF mode
-            val afStart = if (tracker != null && autoFocusMode != null) System.nanoTime() else null
-            lockAutoFocusBeforeCapture(
-                device = cameraDevice,
-                session = captureSession,
-                reader = reader,
-                handler = handler,
-                autoFocusMode = autoFocusMode,
+            engine.executeStillCapture(
+                tracker = tracker,
                 diagnosticsTracker = diagnosticsTracker,
-                afRegions = afRegionsToApply,
-                aeRegions = aeRegionsToApply,
+                focusTarget = focusTarget,
                 sessionReadyGate = sessionReadyGate
             )
-            if (afStart != null) {
-                tracker?.afWaitMs = (System.nanoTime() - afStart) / 1_000_000L
-            }
-
-            val stillStart = tracker?.let { System.nanoTime() }
-            val requestTag = Any()
-
-            var correlatorForCleanup: CaptureTimestampCorrelator<Image>? = null
-
-            val correlatedFrame = try {
-                suspendCancellableCoroutine<TimestampCorrelatedCopiedFrame> { cont ->
-                    val requestCorrelator = CaptureTimestampCorrelator<Image>(
-                        requestTag = requestTag,
-                        timestampExtractor = { image -> image.timestamp },
-                        releaser = { image ->
-                            try {
-                                image.close()
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Error closing candidate image", e)
-                            }
-                        },
-                        onOutcome = { outcome ->
-                            when (outcome) {
-                                is CorrelationOutcome.Success -> {
-                                    val image = outcome.candidate
-                                    val sensorTs = outcome.timestamp
-                                    var copiedFrame: CopiedImageFrame? = null
-                                    var transferFailure: Throwable? = null
-                                    try {
-                                        copiedFrame = CopiedImageFrame.copyFrom(image)
-                                    } catch (failure: Throwable) {
-                                        Log.e(TAG, "Failed to copy frame from matched image", failure)
-                                        transferFailure = failure
-                                    }
-
-                                    try {
-                                        image.close()
-                                    } catch (closeFailure: Throwable) {
-                                        Log.e(TAG, "Failed to close matched image", closeFailure)
-                                        val copyFailure = transferFailure
-                                        if (copyFailure == null) {
-                                            transferFailure = closeFailure
-                                        } else if (copyFailure !== closeFailure) {
-                                            copyFailure.addSuppressed(closeFailure)
-                                        }
-                                    }
-
-                                    val completedFrame = copiedFrame
-                                    val terminalFailure = transferFailure
-                                    if (terminalFailure != null) {
-                                        cont.resumeWithException(terminalFailure)
-                                    } else if (completedFrame != null) {
-                                        Log.d(TAG, "Exact timestamp correlation matched: $sensorTs ns")
-                                        cont.resume(
-                                            TimestampCorrelatedCopiedFrame(completedFrame, sensorTs)
-                                        )
-                                    } else {
-                                        cont.resumeWithException(
-                                            IllegalStateException(
-                                                "Matched image transfer produced neither a frame nor a failure"
-                                            )
-                                        )
-                                    }
-                                }
-                                is CorrelationOutcome.Failure -> {
-                                    Log.e(TAG, "Timestamp correlation failed", outcome.cause)
-                                    cont.resumeWithException(outcome.cause)
-                                }
-                            }
-                        }
-                    )
-                    correlatorForCleanup = requestCorrelator
-
-                    reader.setOnImageAvailableListener({ imageReaderRef ->
-                        while (true) {
-                            val image = try {
-                                imageReaderRef.acquireNextImage()
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Error acquiring next image from ImageReader", e)
-                                requestCorrelator.onCandidateAcquisitionError(e)
-                                null
-                            } ?: break
-
-                            requestCorrelator.onCandidateAvailable(image)
-                        }
-                    }, handler)
-
-                    val builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                    builder.setTag(requestTag)
-                    builder.addTarget(reader.surface)
-                    autoFocusMode?.let { builder.set(CaptureRequest.CONTROL_AF_MODE, it) }
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    builder.set(
-                        CaptureRequest.CONTROL_CAPTURE_INTENT,
-                        CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE
-                    )
-                    afRegionsToApply?.let { builder.set(CaptureRequest.CONTROL_AF_REGIONS, it) }
-                    aeRegionsToApply?.let { builder.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
-
-                    val stillCallback = object : CameraCaptureSession.CaptureCallback() {
-                        override fun onCaptureCompleted(
-                            session: CameraCaptureSession,
-                            request: CaptureRequest,
-                            result: android.hardware.camera2.TotalCaptureResult
-                        ) {
-                            val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
-                            Log.d(TAG, "Still capture completed for sequence ${result.sequenceId}, sensor timestamp: $ts ns")
-                            requestCorrelator.onCaptureCompleted(
-                                sequenceId = result.sequenceId,
-                                sensorTimestamp = ts,
-                                tag = request.tag
-                            )
-                        }
-
-                        override fun onCaptureFailed(
-                            session: CameraCaptureSession,
-                            request: CaptureRequest,
-                            failure: android.hardware.camera2.CaptureFailure
-                        ) {
-                            Log.e(TAG, "Still capture failed for sequence ${failure.sequenceId}, reason: ${failure.reason}")
-                            requestCorrelator.onCaptureFailed(
-                                sequenceId = failure.sequenceId,
-                                tag = request.tag
-                            )
-                        }
-
-                        override fun onCaptureBufferLost(
-                            session: CameraCaptureSession,
-                            request: CaptureRequest,
-                            target: Surface,
-                            frameNumber: Long
-                        ) {
-                            Log.e(TAG, "Still capture buffer lost for request tag ${request.tag}, frame: $frameNumber")
-                            requestCorrelator.onCaptureBufferLost(
-                                tag = request.tag,
-                                frameNumber = frameNumber
-                            )
-                        }
-
-                        override fun onCaptureSequenceCompleted(
-                            session: CameraCaptureSession,
-                            sequenceId: Int,
-                            frameNumber: Long
-                        ) {
-                            Log.d(TAG, "Still capture sequence $sequenceId completed at frame $frameNumber")
-                            requestCorrelator.onCaptureSequenceCompleted(sequenceId = sequenceId)
-                        }
-
-                        override fun onCaptureSequenceAborted(
-                            session: CameraCaptureSession,
-                            sequenceId: Int
-                        ) {
-                            Log.e(TAG, "Still capture sequence $sequenceId aborted")
-                            requestCorrelator.onCaptureSequenceAborted(sequenceId = sequenceId)
-                        }
-                    }
-
-                    try {
-                        val sequenceId = captureSession.capture(builder.build(), stillCallback, handler)
-                        requestCorrelator.registerSequenceId(sequenceId)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to submit still capture request", e)
-                        requestCorrelator.onSubmissionOrCopyFailed(e)
-                    }
-
-                    cont.invokeOnCancellation {
-                        Log.d(TAG, "Single frame capture cancelled")
-                        try {
-                            reader.setOnImageAvailableListener(null, null)
-                        } catch (_: Throwable) {}
-                        requestCorrelator.close()
-                    }
-                }
-            } finally {
-                try {
-                    reader.setOnImageAvailableListener(null, null)
-                } catch (_: Throwable) {}
-                correlatorForCleanup?.close()
-            }
-
-            val frame = correlatedFrame.frame
-            if (diagnosticsTracker != null) {
-                diagnosticsTracker.stillCaptureResultTimestamp = correlatedFrame.resultTimestamp
-                diagnosticsTracker.copiedImageTimestamp = frame.timestamp
-                diagnosticsTracker.captureWidth = frame.width
-                diagnosticsTracker.captureHeight = frame.height
-                diagnosticsTracker.imageFormat = "YUV_420_888"
-            }
-            if (stillStart != null) {
-                tracker?.stillCaptureMs = (System.nanoTime() - stillStart) / 1_000_000L
-            }
-            if (totalStart != null) {
-                tracker?.totalCamera2CaptureMs = (System.nanoTime() - totalStart) / 1_000_000L
-            }
-
-            frame
         } finally {
+            try {
+                reader.setOnImageAvailableListener(null, null)
+            } catch (_: Exception) {
+                // Resource owner close remains authoritative.
+            }
+            imageRouter.close()
             resourceOwner.close()
         }
     }
-
-    private suspend fun warmUpAutoExposure(
-        device: CameraDevice,
-        session: CameraCaptureSession,
-        reader: ImageReader,
-        handler: Handler,
-        autoFocusMode: Int?,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
-        afRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
-        aeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?
-    ) {
-        suspendCancellableCoroutine<Unit> { cont ->
-            val isWarmupDone = AtomicBoolean(false)
-            var frameCount = 0
-
-            fun finishWarmup(timedOut: Boolean, aeState: Int?) {
-                if (!isWarmupDone.compareAndSet(false, true)) {
-                    return
-                }
-                if (diagnosticsTracker != null) {
-                    diagnosticsTracker.aeWarmupExitState = FocusLensDiagnosticsHelper.mapAeState(aeState)
-                        ?: if (timedOut) "NULL_TIMEOUT" else "NULL_CONVERGED"
-                    diagnosticsTracker.aeWarmupFrameCount = frameCount
-                }
-                try {
-                    session.stopRepeating()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Unable to stop AE warmup repeating request", e)
-                }
-                drainImageReader(reader)
-                reader.setOnImageAvailableListener(null, null)
-
-                if (timedOut) {
-                    Log.w(TAG, "AE warmup hit frame cap of $AE_WARMUP_MAX_FRAMES frames (AE state=$aeState)")
-                } else {
-                    Log.d(TAG, "AE warmup completed successfully in $frameCount frames")
-                }
-
-                if (cont.isActive) {
-                    cont.resume(Unit)
-                }
-            }
-
-            reader.setOnImageAvailableListener({ imageReaderRef ->
-                drainImageReader(imageReaderRef)
-            }, handler)
-
-            val warmupRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(reader.surface)
-                autoFocusMode?.let { set(CaptureRequest.CONTROL_AF_MODE, it) }
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
-                aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
-            }
-
-            val callback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: android.hardware.camera2.TotalCaptureResult
-                ) {
-                    frameCount++
-                    val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
-                    val aeReady = aeState == null ||
-                        aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
-                        aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
-                        aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
-
-                    if (frameCount >= AE_WARMUP_MIN_FRAMES && aeReady) {
-                        finishWarmup(timedOut = false, aeState = aeState)
-                    } else if (frameCount >= AE_WARMUP_MAX_FRAMES) {
-                        finishWarmup(timedOut = true, aeState = aeState)
-                    }
-                }
-
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    Log.w(TAG, "AE warmup frame failed: ${failure.reason}")
-                    frameCount++
-                    if (frameCount >= AE_WARMUP_MAX_FRAMES) {
-                        finishWarmup(timedOut = true, aeState = null)
-                    }
-                }
-            }
-
-            try {
-                session.setRepeatingRequest(warmupRequest.build(), callback, handler)
-            } catch (e: Exception) {
-                reader.setOnImageAvailableListener(null, null)
-                if (cont.isActive) {
-                    cont.resumeWithException(e)
-                }
-            }
-
-            cont.invokeOnCancellation {
-                if (isWarmupDone.compareAndSet(false, true)) {
-                    try {
-                        session.stopRepeating()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Unable to stop cancelled AE warmup", e)
-                    }
-                    drainImageReader(reader)
-                    reader.setOnImageAvailableListener(null, null)
-                }
-            }
-        }
-    }
-
-    private suspend fun lockAutoFocusBeforeCapture(
-        device: CameraDevice,
-        session: CameraCaptureSession,
-        reader: ImageReader,
-        handler: Handler,
-        autoFocusMode: Int?,
-        diagnosticsTracker: FocusLensDiagnosticsTracker? = null,
-        afRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
-        aeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
-        sessionReadyGate: CameraSessionReadyGate
-    ) {
-        suspendCancellableCoroutine<Unit> { cont ->
-            val isFocusBoundaryStarted = AtomicBoolean(false)
-            val isFocusCompletionDelivered = AtomicBoolean(false)
-            val triggerIssued = AtomicBoolean(false)
-            val triggerSubmissionLock = Any()
-            val policy = autoFocusMode?.let(::AutoFocusWaitPolicy)
-
-            fun combineFailures(primary: Throwable?, additional: Throwable): Throwable {
-                if (primary == null) {
-                    return additional
-                }
-                if (primary !== additional) {
-                    primary.addSuppressed(additional)
-                }
-                return primary
-            }
-
-            fun drainAndClearListener(primaryFailure: Throwable?): Throwable? {
-                var terminalFailure = primaryFailure
-                try {
-                    drainImageReader(reader)
-                } catch (cleanupFailure: Throwable) {
-                    terminalFailure = combineFailures(terminalFailure, cleanupFailure)
-                }
-                try {
-                    reader.setOnImageAvailableListener(null, null)
-                } catch (cleanupFailure: Throwable) {
-                    terminalFailure = combineFailures(terminalFailure, cleanupFailure)
-                }
-                return terminalFailure
-            }
-
-            fun logFocusWaitOutcome(
-                outcome: AutoFocusWaitOutcome?,
-                repeatingFrameCount: Int,
-                failure: Throwable?
-            ) {
-                when (outcome) {
-                    null -> {
-                        Log.d(TAG, "Skipping AF lock because camera reports fixed-focus/no triggerable AF")
-                    }
-                    AutoFocusWaitOutcome.FOCUSED -> {
-                        Log.d(
-                            TAG,
-                            "AF lock completed successfully in $repeatingFrameCount repeating frames"
-                        )
-                    }
-                    AutoFocusWaitOutcome.FRAME_CAP_TIMEOUT -> {
-                        Log.w(TAG, "AF lock hit frame cap of $AF_LOCK_MAX_FRAMES repeating frames")
-                    }
-                    else -> Log.w(TAG, "AF lock failed: $outcome", failure)
-                }
-            }
-
-            fun completeFocusWaitAfterBoundary(
-                outcome: AutoFocusWaitOutcome?,
-                result: android.hardware.camera2.TotalCaptureResult?,
-                requestProvenance: String,
-                failure: Throwable?
-            ) {
-                if (!isFocusCompletionDelivered.compareAndSet(false, true)) {
-                    return
-                }
-
-                sessionReadyGate.disarm()
-                val completionFailure = drainAndClearListener(failure)
-                val repeatingFrameCount = policy?.repeatingFrameCount ?: 0
-                diagnosticsTracker?.publishAfWaitOutcome(
-                    if (outcome == null) {
-                        FocusWaitDiagnosticSample(
-                            resultAfMode = null,
-                            resultAfRegions = null,
-                            resultAeRegions = null,
-                            resultScalerCrop = null,
-                            afState = null,
-                            repeatingFrameCount = null,
-                            exitReason = "FIXED_FOCUS",
-                            afTriggerIssued = false,
-                            requestProvenance = "NONE"
-                        )
-                    } else {
-                        createFocusWaitDiagnosticSample(
-                            result = result,
-                            outcome = outcome,
-                            repeatingFrameCount = repeatingFrameCount,
-                            afTriggerIssued = triggerIssued.get(),
-                            requestProvenance = requestProvenance
-                        )
-                    }
-                )
-                logFocusWaitOutcome(outcome, repeatingFrameCount, completionFailure)
-
-                if (cont.isActive) {
-                    if (completionFailure != null) {
-                        cont.resumeWithException(completionFailure)
-                    } else {
-                        cont.resume(Unit)
-                    }
-                }
-            }
-
-            fun failFocusSetup(failure: Throwable) {
-                if (!isFocusBoundaryStarted.compareAndSet(false, true) ||
-                    !isFocusCompletionDelivered.compareAndSet(false, true)
-                ) {
-                    return
-                }
-
-                sessionReadyGate.disarm()
-                var terminalFailure: Throwable = failure
-                try {
-                    session.stopRepeating()
-                } catch (cleanupFailure: Throwable) {
-                    terminalFailure = combineFailures(terminalFailure, cleanupFailure)
-                }
-                terminalFailure = drainAndClearListener(terminalFailure) ?: terminalFailure
-                if (cont.isActive) {
-                    cont.resumeWithException(terminalFailure)
-                }
-            }
-
-            fun finishFocusWait(
-                outcome: AutoFocusWaitOutcome?,
-                result: android.hardware.camera2.TotalCaptureResult?,
-                requestProvenance: String,
-                failure: Throwable? = null
-            ) {
-                synchronized(triggerSubmissionLock) {
-                    if (!isFocusBoundaryStarted.compareAndSet(false, true)) {
-                        return
-                    }
-
-                    val armResult = sessionReadyGate.arm {
-                        completeFocusWaitAfterBoundary(
-                            outcome = outcome,
-                            result = result,
-                            requestProvenance = requestProvenance,
-                            failure = failure
-                        )
-                    }
-                    if (armResult == CameraSessionReadyArmResult.ALREADY_READY_AFTER_ACTIVITY) {
-                        val completionFailure = if (autoFocusMode == null) {
-                            failure
-                        } else {
-                            IllegalStateException(
-                                "AF work reached an already-ready session boundary after submission"
-                            ).also { invariantFailure ->
-                                failure?.let { combineFailures(invariantFailure, it) }
-                            }
-                        }
-                        completeFocusWaitAfterBoundary(
-                            outcome = outcome,
-                            result = result,
-                            requestProvenance = requestProvenance,
-                            failure = completionFailure
-                        )
-                        return
-                    }
-                    if (armResult != CameraSessionReadyArmResult.ARMED) {
-                        val armFailure = IllegalStateException(
-                            "Unable to arm Camera2 session-ready boundary: $armResult"
-                        )
-                        failure?.let { combineFailures(armFailure, it) }
-                        completeFocusWaitAfterBoundary(
-                            outcome = outcome,
-                            result = result,
-                            requestProvenance = requestProvenance,
-                            failure = armFailure
-                        )
-                        return
-                    }
-
-                    if (isFocusCompletionDelivered.get()) {
-                        sessionReadyGate.disarm()
-                        return
-                    }
-
-                    try {
-                        session.stopRepeating()
-                    } catch (stopFailure: Throwable) {
-                        sessionReadyGate.disarm()
-                        failure?.let { combineFailures(stopFailure, it) }
-                        completeFocusWaitAfterBoundary(
-                            outcome = outcome,
-                            result = result,
-                            requestProvenance = requestProvenance,
-                            failure = stopFailure
-                        )
-                    }
-                }
-            }
-
-            reader.setOnImageAvailableListener({ imageReaderRef ->
-                drainImageReader(imageReaderRef)
-            }, handler)
-
-            cont.invokeOnCancellation {
-                synchronized(triggerSubmissionLock) {
-                    if (isFocusCompletionDelivered.compareAndSet(false, true)) {
-                        isFocusBoundaryStarted.set(true)
-                        sessionReadyGate.disarm()
-                        try {
-                            session.stopRepeating()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Unable to stop cancelled AF lock", e)
-                        }
-                        try {
-                            drainImageReader(reader)
-                        } catch (cleanupFailure: Throwable) {
-                            Log.w(TAG, "Unable to drain cancelled AF lock images", cleanupFailure)
-                        }
-                        try {
-                            reader.setOnImageAvailableListener(null, null)
-                        } catch (cleanupFailure: Throwable) {
-                            Log.w(TAG, "Unable to clear cancelled AF lock listener", cleanupFailure)
-                        }
-                    }
-                }
-            }
-
-            if (autoFocusMode == null) {
-                finishFocusWait(
-                    outcome = null,
-                    result = null,
-                    requestProvenance = "NONE"
-                )
-                return@suspendCancellableCoroutine
-            }
-
-            val activeAutoFocusMode = checkNotNull(autoFocusMode)
-            val activePolicy = checkNotNull(policy)
-
-            val repeatingCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: android.hardware.camera2.TotalCaptureResult
-                ) {
-                    if (isFocusBoundaryStarted.get()) {
-                        return
-                    }
-                    val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-                    val outcome = activePolicy.onRepeatingCompleted(afState)
-                    if (outcome != null) {
-                        finishFocusWait(
-                            outcome = outcome,
-                            result = result,
-                            requestProvenance = "REPEATING"
-                        )
-                    }
-                }
-
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    if (isFocusBoundaryStarted.get()) {
-                        return
-                    }
-                    Log.w(TAG, "AF lock frame failed: ${failure.reason}")
-                    val outcome = activePolicy.onRepeatingFailed()
-                    if (outcome != null) {
-                        finishFocusWait(
-                            outcome = outcome,
-                            result = null,
-                            requestProvenance = "REPEATING"
-                        )
-                    }
-                }
-            }
-
-            val triggerCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: android.hardware.camera2.TotalCaptureResult
-                ) {
-                    synchronized(triggerSubmissionLock) {
-                        if (!isFocusBoundaryStarted.get()) {
-                            activePolicy.onTriggerCompleted()
-                        }
-                    }
-                }
-
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    synchronized(triggerSubmissionLock) {
-                        if (isFocusBoundaryStarted.get()) {
-                            return
-                        }
-                        val outcome = activePolicy.onTriggerFailed(aborted = false) ?: return
-                        finishFocusWait(
-                            outcome = outcome,
-                            result = null,
-                            requestProvenance = "TRIGGER",
-                            failure = IllegalStateException(
-                                "Autofocus trigger request failed with reason ${failure.reason}"
-                            )
-                        )
-                    }
-                }
-
-                override fun onCaptureSequenceAborted(
-                    session: CameraCaptureSession,
-                    sequenceId: Int
-                ) {
-                    synchronized(triggerSubmissionLock) {
-                        if (isFocusBoundaryStarted.get()) {
-                            return
-                        }
-                        val outcome = activePolicy.onTriggerFailed(aborted = true) ?: return
-                        finishFocusWait(
-                            outcome = outcome,
-                            result = null,
-                            requestProvenance = "TRIGGER",
-                            failure = IllegalStateException("Autofocus trigger request was aborted")
-                        )
-                    }
-                }
-            }
-
-            val repeatingRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(reader.surface)
-                set(CaptureRequest.CONTROL_AF_MODE, activeAutoFocusMode)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
-                aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
-            }
-            try {
-                synchronized(triggerSubmissionLock) {
-                    if (!cont.isActive || isFocusBoundaryStarted.get()) {
-                        return@suspendCancellableCoroutine
-                    }
-                    session.setRepeatingRequest(repeatingRequest.build(), repeatingCallback, handler)
-                }
-            } catch (failure: Throwable) {
-                failFocusSetup(failure)
-                return@suspendCancellableCoroutine
-            }
-
-            if (shouldTriggerAutoFocus(activeAutoFocusMode)) {
-                try {
-                    val triggerRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                        addTarget(reader.surface)
-                        set(CaptureRequest.CONTROL_AF_MODE, activeAutoFocusMode)
-                        set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                        afRegions?.let { set(CaptureRequest.CONTROL_AF_REGIONS, it) }
-                        aeRegions?.let { set(CaptureRequest.CONTROL_AE_REGIONS, it) }
-                    }
-                    synchronized(triggerSubmissionLock) {
-                        if (!cont.isActive || isFocusBoundaryStarted.get()) {
-                            return@synchronized
-                        }
-                        session.capture(triggerRequest.build(), triggerCallback, handler)
-                        triggerIssued.set(true)
-                    }
-                } catch (e: Exception) {
-                    finishFocusWait(
-                        outcome = AutoFocusWaitOutcome.TRIGGER_SUBMISSION_FAILED,
-                        result = null,
-                        requestProvenance = "TRIGGER",
-                        failure = e
-                    )
-                }
-            }
-        }
-    }
-
-    private fun createFocusWaitDiagnosticSample(
-        result: android.hardware.camera2.TotalCaptureResult?,
-        outcome: AutoFocusWaitOutcome,
-        repeatingFrameCount: Int,
-        afTriggerIssued: Boolean,
-        requestProvenance: String
-    ): FocusWaitDiagnosticSample {
-        val rawAfRegions = result?.get(CaptureResult.CONTROL_AF_REGIONS)
-        val rawAeRegions = result?.get(CaptureResult.CONTROL_AE_REGIONS)
-        val crop = result?.get(CaptureResult.SCALER_CROP_REGION)
-        return FocusWaitDiagnosticSample(
-            resultAfMode = FocusLensDiagnosticsHelper.mapAfMode(
-                result?.get(CaptureResult.CONTROL_AF_MODE)
-            ),
-            resultAfRegions = formatMeteringRegions(rawAfRegions),
-            resultAeRegions = formatMeteringRegions(rawAeRegions),
-            resultScalerCrop = crop?.let {
-                "Rect(${it.left}, ${it.top}, ${it.width()}x${it.height()})"
-            },
-            afState = FocusLensDiagnosticsHelper.mapAfState(
-                result?.get(CaptureResult.CONTROL_AF_STATE)
-            ),
-            repeatingFrameCount = repeatingFrameCount,
-            exitReason = outcome.name,
-            afTriggerIssued = afTriggerIssued,
-            requestProvenance = requestProvenance
-        )
-    }
-
-    private fun formatMeteringRegions(
-        regions: Array<android.hardware.camera2.params.MeteringRectangle>?
-    ): String? {
-        if (regions.isNullOrEmpty()) {
-            return null
-        }
-        return regions.joinToString(", ") { region ->
-            "Rect(${region.rect.left}, ${region.rect.top}, ${region.rect.width()}x${region.rect.height()} wt=${region.meteringWeight})"
-        }
-    }
-
-    private fun drainImageReader(reader: ImageReader) {
-        while (true) {
-            val image = try {
-                // acquireNextImage() drains FIFO without auto-discarding intermediate
-                // frames, making the drain deterministic regardless of queue depth.
-                reader.acquireNextImage()
-            } catch (e: IllegalStateException) {
-                Log.w(TAG, "Unable to drain ImageReader", e)
-                null
-            } ?: break
-            image.close()
-        }
-    }
-
 }

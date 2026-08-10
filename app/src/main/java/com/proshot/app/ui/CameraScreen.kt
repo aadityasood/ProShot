@@ -63,6 +63,7 @@ import com.proshot.app.camera.CaptureTimingTracker
 import com.proshot.app.camera.FocusLensDiagnostics
 import com.proshot.app.camera.FocusLensDiagnosticsTracker
 import com.proshot.app.camera.FocusMeteringTarget
+import com.proshot.app.camera.DirectPreviewTransform
 import com.proshot.app.camera.PreviewTapFocusMapper
 import com.proshot.app.camera.compat.CompatibilityDecision
 import com.proshot.app.camera.compat.CompatibilityPolicy
@@ -212,10 +213,11 @@ private fun ActivePreviewContent(
     lifecycleOwner: androidx.lifecycle.LifecycleOwner,
     onCameraError: (String) -> Unit
 ) {
-    val previewView = remember(context) {
-        PreviewView(context).apply {
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-        }
+    val isDebugBuild = remember(context) {
+        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    }
+    val ownershipRoute = remember(isDebugBuild) {
+        com.proshot.app.camera.CameraOwnershipRoutePolicy.select(isDebugBuild)
     }
 
     var isCapturing by remember { mutableStateOf(false) }
@@ -223,9 +225,6 @@ private fun ActivePreviewContent(
     var captureFeedbackState by remember { mutableStateOf<CaptureFeedbackState>(CaptureFeedbackState.Hidden()) }
     var focusStatusMessage by remember { mutableStateOf("") }
     var showDebugOverlay by remember { mutableStateOf(false) }
-    val isDebugBuild = remember(context) {
-        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-    }
     val scope = rememberCoroutineScope()
     val isPreviewReady by cameraCaptureRuntime.isPreviewReady.collectAsState()
 
@@ -234,6 +233,9 @@ private fun ActivePreviewContent(
     var tapPosition by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
     var tapCounter by remember { mutableIntStateOf(0) }
     var sensorOrientationDegrees by remember { mutableIntStateOf(90) }
+    var directPreviewTransform by remember {
+        mutableStateOf<DirectPreviewTransform?>(null)
+    }
 
     var lastCaptureTiming by remember { mutableStateOf<CaptureTiming?>(null) }
     var lastFocusLensDiagnostics by remember { mutableStateOf<FocusLensDiagnostics?>(null) }
@@ -336,42 +338,16 @@ private fun ActivePreviewContent(
         }
     }
 
-    LaunchedEffect(cameraCaptureRuntime, lifecycleOwner, previewView) {
-        var attachmentGeneration: Long? = null
-        try {
-            attachmentGeneration = cameraCaptureRuntime.attach(lifecycleOwner, previewView)
-            if (attachmentGeneration == null) {
-                return@LaunchedEffect
-            }
-            awaitCancellation()
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            Log.e(TAG, "Failed to attach camera preview", error)
-            onCameraError("Camera could not start. Please try again.")
-        } finally {
-            withContext(NonCancellable) {
-                attachmentGeneration?.let { generation ->
-                    try {
-                        cameraCaptureRuntime.detach(generation)
-                    } catch (error: Exception) {
-                        Log.e(TAG, "Failed to detach camera preview", error)
-                    }
-                }
-            }
-        }
-    }
-
     LaunchedEffect(context) {
         capabilityState = withContext(Dispatchers.IO) {
-            val caps = CameraCapabilitiesMapper.map(context)
-            val decision = CompatibilityPolicy.select(caps)
-            caps to decision
+            val capabilities = CameraCapabilitiesMapper.map(context)
+            val decision = CompatibilityPolicy.select(capabilities)
+            capabilities to decision
         }
         sensorOrientationDegrees = withContext(Dispatchers.IO) {
             try {
                 cameraCaptureRuntime.resolveSensorOrientation(context)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 90
             }
         }
@@ -391,10 +367,54 @@ private fun ActivePreviewContent(
             displayRotationDegrees = displayRotation
         )
 
-        AndroidView(
-            factory = { previewView },
-            modifier = Modifier.fillMaxSize()
-        )
+        if (ownershipRoute ==
+            com.proshot.app.camera.CameraOwnershipRoute.PERSISTENT_CAMERA2
+        ) {
+            DirectCamera2PreviewHost(
+                cameraCaptureRuntime = cameraCaptureRuntime,
+                displayRotationDegrees = displayRotation,
+                onTransformChanged = { directPreviewTransform = it },
+                onCameraError = onCameraError
+            )
+        } else {
+            val previewView = remember(context) {
+                PreviewView(context).apply {
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }
+            }
+            LaunchedEffect(cameraCaptureRuntime, lifecycleOwner, previewView) {
+                var attachmentGeneration: Long? = null
+                try {
+                    attachmentGeneration = cameraCaptureRuntime.attach(
+                        lifecycleOwner,
+                        previewView
+                    )
+                    if (attachmentGeneration == null) {
+                        return@LaunchedEffect
+                    }
+                    awaitCancellation()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    Log.e(TAG, "Failed to attach camera preview", error)
+                    onCameraError("Camera could not start. Please try again.")
+                } finally {
+                    withContext(NonCancellable) {
+                        attachmentGeneration?.let { generation ->
+                            try {
+                                cameraCaptureRuntime.detach(generation)
+                            } catch (error: Exception) {
+                                Log.e(TAG, "Failed to detach camera preview", error)
+                            }
+                        }
+                    }
+                }
+            }
+            AndroidView(
+                factory = { previewView },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         if (gridVisible) {
             RuleOfThirdsGrid()
@@ -403,16 +423,34 @@ private fun ActivePreviewContent(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(isCapturing, isPreviewReady) {
+                .pointerInput(
+                    isCapturing,
+                    isPreviewReady,
+                    ownershipRoute,
+                    directPreviewTransform
+                ) {
                     detectTapGestures { offset ->
-                        if (!isCapturing && isPreviewReady && size.width > 0 && size.height > 0) {
-                            val target = PreviewTapFocusMapper.mapToSensorTarget(
-                                tapX = offset.x,
-                                tapY = offset.y,
-                                viewWidth = size.width,
-                                viewHeight = size.height,
-                                rotationDegrees = sensorOrientationDegrees
-                            )
+                        if (!isCapturing &&
+                            isPreviewReady &&
+                            size.width > 0 &&
+                            size.height > 0
+                        ) {
+                            val target = if (ownershipRoute ==
+                                com.proshot.app.camera.CameraOwnershipRoute.PERSISTENT_CAMERA2
+                            ) {
+                                directPreviewTransform?.mapTapToSensorTarget(
+                                    offset.x,
+                                    offset.y
+                                ) ?: return@detectTapGestures
+                            } else {
+                                PreviewTapFocusMapper.mapToSensorTarget(
+                                    tapX = offset.x,
+                                    tapY = offset.y,
+                                    viewWidth = size.width,
+                                    viewHeight = size.height,
+                                    rotationDegrees = sensorOrientationDegrees
+                                )
+                            }
                             tapCounter++
                             tapPosition = offset
                             focusRingVisible = true
@@ -424,11 +462,11 @@ private fun ActivePreviewContent(
         )
 
         if (focusRingVisible && tapPosition != null) {
-            val pos = tapPosition!!
+            val position = tapPosition!!
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawCircle(
                     color = Color.Yellow,
-                    center = pos,
+                    center = position,
                     radius = 30.dp.toPx(),
                     style = Stroke(width = 2.dp.toPx())
                 )
@@ -441,7 +479,10 @@ private fun ActivePreviewContent(
                     .align(Alignment.TopEnd)
                     .padding(top = 48.dp, end = 16.dp)
                     .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                    .background(Color.Black.copy(alpha = 0.6f), shape = RoundedCornerShape(16.dp))
+                    .background(
+                        Color.Black.copy(alpha = 0.6f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
                     .clickable { showDebugOverlay = !showDebugOverlay }
                     .semantics {
                         role = Role.Button
@@ -450,7 +491,11 @@ private fun ActivePreviewContent(
                         } else {
                             "Show debug diagnostics"
                         }
-                        stateDescription = if (showDebugOverlay) "Expanded" else "Collapsed"
+                        stateDescription = if (showDebugOverlay) {
+                            "Expanded"
+                        } else {
+                            "Collapsed"
+                        }
                     }
                     .padding(horizontal = 12.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center
@@ -471,7 +516,12 @@ private fun ActivePreviewContent(
                         .align(Alignment.TopStart)
                         .padding(top = 48.dp, start = 16.dp)
                 ) {
-                    DebugStatusOverlay(capabilities, decision, lastCaptureTiming, lastFocusLensDiagnostics)
+                    DebugStatusOverlay(
+                        capabilities,
+                        decision,
+                        lastCaptureTiming,
+                        lastFocusLensDiagnostics
+                    )
                 }
             }
         }

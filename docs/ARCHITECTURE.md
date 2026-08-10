@@ -16,37 +16,48 @@ Status vocabulary:
 
 ## Current Runtime Data Flow
 
-The sole executed image path is `IMPLEMENTED`:
+The executed image path is `IMPLEMENTED` with two generation-bound routes:
 
 ```text
 Jetpack Compose camera screen
-  -> CameraX preview
-  -> CameraCaptureRuntime-owned CameraX unbind
-  -> Camera2 single YUV_420_888 capture
+  -> Route Policy (PERSISTENT_CAMERA2 in debuggable; CAMERA_X_HANDOFF in release)
+  -> PERSISTENT_CAMERA2: Compose DirectCamera2PreviewHost (TextureView)
+       -> DirectCamera2PreviewController persistent session
+       -> Camera2StillCaptureEngine YUV_420_888 capture (zero unbind/rebind)
+  -> CAMERA_X_HANDOFF: Compose PreviewView
+       -> CameraX preview
+       -> CameraCaptureRuntime-owned CameraX unbind
+       -> Camera2 single YUV_420_888 capture
+       -> CameraCaptureRuntime-owned CameraX rebind
   -> copied image planes on the JVM heap
   -> NV21 conversion and output-orientation rotation
   -> ProShot Natural v0 global luma and chroma LUTs
   -> JPEG compression
   -> MediaStore save (Pictures/ProShot on API 29+; default shared location on API 26-28)
-  -> CameraCaptureRuntime-owned CameraX rebind
 ```
 
-This is an early single-frame, CPU-based prototype. It is not currently a
-temporal, RAW, linear high-bit, semantic, or native multi-frame pipeline.
+The direct Camera2 route is intentionally limited to debuggable builds while its
+device compatibility evidence is collected. Release builds continue to use the
+CameraX handoff route. This remains an early single-frame, CPU-based prototype;
+it is not a temporal, RAW, linear high-bit, semantic, or native multi-frame
+pipeline.
 
 ## Implemented Components
 
-### CameraX Preview and Capture Lifecycle Ownership
+### Camera Preview and Capture Lifecycle Ownership
 
 `CameraCaptureRuntime` is configuration-retained and Activity-owned. Hilt keeps
-one runtime core through configuration recreation, while the owner is released
-when the logical Activity finishes rather than becoming process-global. Its
-generation-based lifecycle state machine covers detached, attaching, ready,
-capturing, rebinding, and detaching states. Initial preview attachment is
-awaited before readiness is exposed to the UI. A fail-fast coroutine mutex
-covers the complete unbind, capture/process/save, and rebind transaction; a
-concurrent request returns a stable busy result without preview, capture,
-processing, save, or rebind work.
+one runtime core and one stable `previewReady` `StateFlow` through configuration
+recreation, while the owner is released when the logical Activity finishes rather
+than becoming process-global. Its generation-based lifecycle state machine covers
+detached, attaching, ready, capturing, rebinding, and detaching states.
+Route policy (`CameraOwnershipRoutePolicy`) selects `PERSISTENT_CAMERA2` for
+debuggable builds and `CAMERA_X_HANDOFF` for release builds. For the persistent direct
+Camera2 route, capture executes `Ready -> Capturing -> Ready` with zero unbind/rebind
+calls; for the CameraX handoff route, capture performs one unbind and one rebind.
+Initial preview attachment is awaited before readiness is exposed to the UI.
+A fail-fast coroutine mutex covers the complete capture transaction; concurrent
+requests return a stable busy result without extra work.
 
 - `CameraXPreviewController` shares the retained Activity component and runtime
   generation domain. It wraps `ProcessCameraProvider` resolution, binding, and
@@ -64,10 +75,30 @@ processing, save, or rebind work.
   is terminated so a missing callback cannot retain the per-capture thread.
   After looper termination, the app cannot act on a vendor callback that is
   never delivered to its callback path.
+- `PersistentCamera2ResourceOwner` owns one generation-specific two-surface
+  direct session, its callback thread, preview `Surface` wrapper, YUV reader,
+  and routing state. Final close first disables image delivery, then closes the
+  router and Camera2 gate, and finally releases the app-owned preview `Surface`;
+  the `TextureView`-owned `SurfaceTexture` is never released by the owner.
+  The callback looper remains available for the exact accepted device's
+  `onClosed` acknowledgement, with a bounded timeout, and replacement attach
+  waits for callback-thread termination before opening another device.
 
-Compose UI (`CameraScreen`) is preview-agnostic. A structured effect requests
-attach/detach, observes readiness, and delegates shutter actions to
-`CameraCaptureRuntime`; it does not resolve or bind the CameraX provider.
+Compose UI (`CameraScreen`) selects exactly one route before constructing a
+preview host. The CameraX branch owns one `PreviewView`; the direct branch owns
+one `TextureView` through `DirectCamera2PreviewHost`. Structured effects request
+generation-bound attach/detach, observe readiness, and delegate shutter actions
+to `CameraCaptureRuntime`; the UI does not open a Camera2 device or resolve a
+CameraX provider itself.
+
+Direct-preview geometry has two deliberately separate coordinate spaces. The
+host applies a TextureView-local content correction that reverses the view's
+default non-uniform stretch, uses uniform center-crop fill, and rotates only by
+negative display rotation because TextureView already compensates sensor
+orientation. A separate raw-buffer-to-view affine transform is retained only for
+inverse tap-focus mapping and is never passed to `TextureView.setTransform()`.
+This debuggable-only direct geometry remains provisional and device-unverified
+until the corrected physical orientation smoke and targeted connected test pass.
 
 ### Beginner Capture Surface and Input
 
@@ -83,19 +114,23 @@ Gallery review UI, flash, zoom/lens selection, exposure compensation, level sens
 
 ### Camera2 Capture and Session Creation
 
-`SingleFrameCaptureController` opens the primary back camera, configures an
-`ImageReader`, and captures one `YUV_420_888` frame. To decouple capture session
-creation, the injected one-surface `Camera2CaptureSessionCreator` contract acts
-as a test seam. On API 28+, it builds a regular session using
-`SessionConfiguration` and one `OutputConfiguration`, dispatching callbacks
-through `HandlerPosterExecutor` onto the same per-capture handler. An unavailable
-handler rejects the executor command explicitly; because Camera2 may dispatch
-callbacks asynchronously, that rejection is not guaranteed to reach the
-original submission call. The capture timeout and resource owner's bounded
-terminal policy remain the fallback when a callback cannot be delivered. On API
-26-27, the creator uses the deprecated legacy `createCaptureSession` overload.
-The pure selector and executor seams do not open a camera or claim coverage of a
-real framework session submission.
+`SingleFrameCaptureController` remains the release rollback source and opens a
+one-surface YUV session per capture. The debuggable direct route instead opens a
+persistent session with ordered preview and YUV surfaces before shutter input.
+The injected `Camera2CaptureSessionCreator` rejects an empty output list and
+preserves list order. On API 28+, it creates one `OutputConfiguration` per
+surface in a regular `SessionConfiguration`; on API 26-27 it passes the same
+ordered list to the legacy overload. `HandlerPosterExecutor` keeps modern
+callbacks on the owner handler and rejects an unavailable handler explicitly.
+
+Both routes use one session-bound `Camera2StillCaptureEngine` for AE warm-up,
+AF policy, crop-aware regions, the final session-ready boundary, and the exact
+timestamp-correlated still. `Camera2ImageReaderRouter` normally drains FIFO
+images and installs one request correlator only after an acquisition-serialized
+final drain. The direct preview repeating request targets only the preview
+surface; YUV is targeted only by the still request. The pure creator, stream
+selector, router, and geometry seams do not by themselves claim real framework
+or device compatibility.
 
 The current pre-capture order is:
 
@@ -113,7 +148,9 @@ gate. AF and AE regions use crop-aware normalized coordinate mapping.
 
 ### Capture-to-Save Coordination
 
-`CaptureCoordinator` always calls `captureSingleFrame`. It then:
+`CaptureCoordinator` receives the generation-bound `CameraFrameSource` selected
+by `CameraCaptureRuntime` and keeps one shared processing/save implementation. It
+then:
 
 1. Converts copied YUV planes to a contiguous NV21 byte array.
 2. Rotates NV21 pixels to the resolved output orientation.
@@ -249,7 +286,8 @@ photo. A real compatibility router and every tier-specific route are `PLANNED`.
 
 Approved `PLANNED` work includes:
 
-- A persistent Camera2 session building on the implemented ownership seams.
+- Representative device validation and a later production-readiness decision
+  for the implemented debuggable-only persistent Camera2 route.
 - Bounded pre-shutter frame history and ZSL evaluation.
 - Timestamp-correlated frame selection and sharpness scoring.
 - RAW or YUV burst capture, alignment, merge, and ghost rejection.
@@ -299,8 +337,9 @@ This repair does not change camera execution, pre-capture gates, LUT processing,
 
 ## Current Technical Debt
 
-- Each shutter action still tears down all CameraX use cases and opens a new
-  Camera2 session; there is no persistent capture session.
+- Release builds still tear down CameraX use cases and open one rollback Camera2
+  session per shutter. Debuggable builds use the provisional persistent Camera2
+  route, whose physical-device compatibility remains unverified.
 - `SingleFrameCaptureController` remains a large capture-policy area despite
   per-capture physical resource ownership moving to a dedicated owner.
 - No runtime/instrumented test covers the complete unbind, capture, and rebind

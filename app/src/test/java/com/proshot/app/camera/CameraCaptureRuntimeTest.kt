@@ -1,5 +1,8 @@
 package com.proshot.app.camera
 
+import android.content.Context
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
@@ -16,7 +19,7 @@ class CameraCaptureRuntimeTest {
         val preview = FakePreviewPort()
         val runtime = readyRuntime(preview)
 
-        val result = runtime.capture(isDebug = false, tracker = null) {
+        val result = runtime.capture(isDebug = false) {
             preview.events += "capture"
             CaptureResult.Success("Saved")
         }
@@ -30,9 +33,7 @@ class CameraCaptureRuntimeTest {
         val preview = FakePreviewPort()
         val runtime = readyRuntime(preview)
 
-        runtime.capture(isDebug = false, tracker = null) {
-            CaptureResult.Success("Saved")
-        }
+        runtime.capture(isDebug = false) { CaptureResult.Success("Saved") }
 
         assertEquals(1, preview.events.count { it == "rebind" })
         assertTrue(runtime.previewReady.value)
@@ -43,9 +44,7 @@ class CameraCaptureRuntimeTest {
         val preview = FakePreviewPort()
         val runtime = readyRuntime(preview)
 
-        val result = runtime.capture(isDebug = false, tracker = null) {
-            CaptureResult.Failure("Save failed")
-        }
+        val result = runtime.capture(isDebug = false) { CaptureResult.Failure("Save failed") }
 
         assertTrue(result is CaptureResult.Failure)
         assertEquals("Save failed", (result as CaptureResult.Failure).message)
@@ -61,7 +60,7 @@ class CameraCaptureRuntimeTest {
         val runtime = readyRuntime(preview)
         var captureCalls = 0
 
-        val result = runtime.capture(isDebug = false, tracker = null) {
+        val result = runtime.capture(isDebug = false) {
             captureCalls += 1
             CaptureResult.Success("Must not run")
         }
@@ -81,7 +80,7 @@ class CameraCaptureRuntimeTest {
         val neverCompletes = CompletableDeferred<CaptureResult>()
 
         val cancelledCapture = async {
-            runtime.capture(isDebug = false, tracker = null) {
+            runtime.capture(isDebug = false) {
                 captureStarted.complete(Unit)
                 neverCompletes.await()
             }
@@ -89,7 +88,7 @@ class CameraCaptureRuntimeTest {
         captureStarted.await()
         cancelledCapture.cancelAndJoin()
 
-        val laterResult = runtime.capture(isDebug = false, tracker = null) {
+        val laterResult = runtime.capture(isDebug = false) {
             CaptureResult.Success("Later capture")
         }
 
@@ -106,7 +105,7 @@ class CameraCaptureRuntimeTest {
         val neverCompletes = CompletableDeferred<CaptureResult>()
 
         val capture = async {
-            runtime.capture(isDebug = false, tracker = null) {
+            runtime.capture(isDebug = false) {
                 captureStarted.complete(Unit)
                 neverCompletes.await()
             }
@@ -130,7 +129,7 @@ class CameraCaptureRuntimeTest {
         var losingCaptureCalls = 0
 
         val first = async {
-            runtime.capture(isDebug = false, tracker = null) {
+            runtime.capture(isDebug = false) {
                 firstStarted.complete(Unit)
                 releaseFirst.await()
             }
@@ -138,16 +137,13 @@ class CameraCaptureRuntimeTest {
         firstStarted.await()
         val eventsBeforeBusyRequest = preview.events.toList()
 
-        val busy = runtime.capture(isDebug = false, tracker = null) {
+        val busy = runtime.capture(isDebug = false) {
             losingCaptureCalls += 1
             CaptureResult.Success("Must not run")
         }
 
         assertTrue(busy is CaptureResult.Failure)
-        assertEquals(
-            "Camera is busy. Please try again.",
-            (busy as CaptureResult.Failure).message
-        )
+        assertEquals("Camera is busy. Please try again.", (busy as CaptureResult.Failure).message)
         assertEquals(0, losingCaptureCalls)
         assertEquals(eventsBeforeBusyRequest, preview.events)
 
@@ -162,7 +158,7 @@ class CameraCaptureRuntimeTest {
         var captureCalls = 0
 
         repeat(2) {
-            val result = runtime.capture(isDebug = false, tracker = null) {
+            val result = runtime.capture(isDebug = false) {
                 captureCalls += 1
                 CaptureResult.Success("Saved")
             }
@@ -176,16 +172,14 @@ class CameraCaptureRuntimeTest {
 
     @Test
     fun captureBeforeAttachIsReadyHasNoPreviewOrCaptureSideEffect() = runBlocking {
-        val preview = FakePreviewPort().apply {
-            attachRelease = CompletableDeferred()
-        }
-        val runtime = CameraCaptureRuntimeCore(preview)
+        val preview = FakePreviewPort().apply { attachRelease = CompletableDeferred() }
+        val runtime = CameraCaptureRuntimeCore()
         var captureCalls = 0
 
-        val attaching = async { runtime.attach(TestAttachment) }
+        val attaching = async { attach(runtime, preview) }
         preview.attachStarted.await()
 
-        val result = runtime.capture(isDebug = false, tracker = null) {
+        val result = runtime.capture(isDebug = false) {
             captureCalls += 1
             CaptureResult.Success("Must not run")
         }
@@ -202,12 +196,10 @@ class CameraCaptureRuntimeTest {
 
     @Test
     fun detachDuringPendingAttachPreventsStaleBinding() = runBlocking {
-        val preview = FakePreviewPort().apply {
-            attachRelease = CompletableDeferred()
-        }
-        val runtime = CameraCaptureRuntimeCore(preview)
+        val preview = FakePreviewPort().apply { attachRelease = CompletableDeferred() }
+        val runtime = CameraCaptureRuntimeCore()
 
-        val attaching = async { runtime.attach(TestAttachment) }
+        val attaching = async { attach(runtime, preview) }
         val pendingGeneration = preview.attachStarted.await()
 
         runtime.detach()
@@ -221,9 +213,9 @@ class CameraCaptureRuntimeTest {
     @Test
     fun staleDetachGenerationCannotClearNewerAttachment() = runBlocking {
         val preview = FakePreviewPort()
-        val runtime = CameraCaptureRuntimeCore(preview)
-        val first = runtime.attach(TestAttachment) as PreviewAttachOutcome.Ready
-        val second = runtime.attach(TestAttachment) as PreviewAttachOutcome.Ready
+        val runtime = CameraCaptureRuntimeCore()
+        val first = attach(runtime, preview) as PreviewAttachOutcome.Ready
+        val second = attach(runtime, preview) as PreviewAttachOutcome.Ready
         val eventsAfterReplacementReady = preview.events.toList()
         val invalidationsAfterReplacementReady = preview.invalidatedGenerations.toSet()
 
@@ -243,7 +235,7 @@ class CameraCaptureRuntimeTest {
         }
         val runtime = readyRuntime(preview)
 
-        val result = runtime.capture(isDebug = false, tracker = null) {
+        val result = runtime.capture(isDebug = false) {
             CaptureResult.Success("Saved to gallery")
         }
 
@@ -253,24 +245,182 @@ class CameraCaptureRuntimeTest {
         assertFalse(runtime.previewReady.value)
     }
 
-    private suspend fun readyRuntime(preview: FakePreviewPort): CameraCaptureRuntimeCore {
-        val runtime = CameraCaptureRuntimeCore(preview)
-        assertTrue(runtime.attach(TestAttachment) is PreviewAttachOutcome.Ready)
+    @Test
+    fun persistentRouteCapturesWithoutUnbindOrRebindAndReturnsReady() = runBlocking {
+        val preview = FakePreviewPort()
+        val runtime = readyRuntime(preview, CameraOwnershipRoute.PERSISTENT_CAMERA2)
+
+        val result = runtime.capture(isDebug = false) {
+            preview.events += "capture"
+            CaptureResult.Success("Saved")
+        }
+
+        assertTrue(result is CaptureResult.Success)
+        assertEquals(listOf("capture"), preview.events)
+        assertTrue(runtime.previewReady.value)
+    }
+
+    @Test
+    fun routeReplacementDetachesOldOwnerBeforeBindingNewOwner() = runBlocking {
+        val preview = FakePreviewPort()
+        val runtime = CameraCaptureRuntimeCore()
+        val first = attach(runtime, preview, CameraOwnershipRoute.CAMERA_X_HANDOFF)
+            as PreviewAttachOutcome.Ready
+
+        val second = attach(runtime, preview, CameraOwnershipRoute.PERSISTENT_CAMERA2)
+            as PreviewAttachOutcome.Ready
+
+        assertTrue(second.generation > first.generation)
+        assertTrue(
+            preview.events.indexOf("detach:${first.generation}") <
+                preview.events.indexOf("attach:${second.generation}")
+        )
+        assertTrue(runtime.previewReady.value)
+    }
+
+    @Test
+    fun terminalPortFailureInvalidatesGenerationAndCancelsActiveCapture() = runBlocking {
+        val reports = mutableListOf<String>()
+        val preview = FakePreviewPort()
+        val runtime = CameraCaptureRuntimeCore(
+            CameraRuntimeErrorReporter { message, _ -> reports += message }
+        )
+        val ready = attach(runtime, preview, CameraOwnershipRoute.PERSISTENT_CAMERA2)
+            as PreviewAttachOutcome.Ready
+        val captureStarted = CompletableDeferred<Unit>()
+        val capture = async {
+            runtime.capture(isDebug = false) {
+                captureStarted.complete(Unit)
+                CompletableDeferred<CaptureResult>().await()
+            }
+        }
+        captureStarted.await()
+
+        runtime.onPortTerminated(ready.generation, IllegalStateException("disconnect"))
+        capture.join()
+
+        assertTrue(capture.isCancelled)
+        assertFalse(runtime.previewReady.value)
+        assertEquals(listOf("Camera preview owner terminated"), reports)
+    }
+
+    @Test
+    fun detachSync_cancelsCaptureBeforePhysicalPortInvalidation() = runBlocking {
+        val preview = FakePreviewPort()
+        val runtime = CameraCaptureRuntimeCore()
+        val ready = attach(runtime, preview, CameraOwnershipRoute.PERSISTENT_CAMERA2)
+            as PreviewAttachOutcome.Ready
+        val captureStarted = CompletableDeferred<Unit>()
+        lateinit var capture: kotlinx.coroutines.Deferred<CaptureResult>
+        var cancellationObservedAtInvalidation = false
+        preview.onInvalidate = {
+            cancellationObservedAtInvalidation = capture.isCancelled
+        }
+        capture = async {
+            runtime.capture(isDebug = false) {
+                captureStarted.complete(Unit)
+                CompletableDeferred<CaptureResult>().await()
+            }
+        }
+        captureStarted.await()
+
+        runtime.detachSync(ready.generation)
+        capture.join()
+
+        assertTrue(cancellationObservedAtInvalidation)
+        assertTrue(capture.isCancelled)
+        assertFalse(runtime.previewReady.value)
+    }
+
+    @Test
+    fun ownerCloseBoundary_releasesControllerStateLockBeforeCloseCallback() {
+        val stateLock = ReentrantLock()
+        val closingOwners = mutableSetOf<String>()
+        var callbackReenteredState = false
+
+        beginOwnerCloseOutsideStateLock(
+            stateLock = stateLock,
+            closingOwners = closingOwners,
+            owner = "owner",
+            closeOwner = { owner ->
+                assertFalse(stateLock.isHeldByCurrentThread)
+                stateLock.withLock {
+                    callbackReenteredState = closingOwners.contains(owner)
+                }
+            }
+        )
+
+        assertTrue(callbackReenteredState)
+        assertEquals(setOf("owner"), closingOwners)
+    }
+
+    @Test
+    fun attachFailureCleansGenerationAndPreservesExactNotReadyMessage() = runBlocking {
+        val preview = FakePreviewPort().apply {
+            attachFailure = IllegalStateException("Hardware error")
+        }
+        val runtime = CameraCaptureRuntimeCore()
+
+        val error = runCatching { attach(runtime, preview) }.exceptionOrNull()
+
+        assertEquals("Hardware error", error?.message)
+        assertFalse(runtime.previewReady.value)
+        assertTrue(preview.events.any { it.startsWith("detach:") })
+        val result = runtime.capture(isDebug = false) { CaptureResult.Success("Must not run") }
+        assertEquals(
+            "Camera is not ready. Please wait.",
+            (result as CaptureResult.Failure).message
+        )
+    }
+
+    private suspend fun readyRuntime(
+        preview: FakePreviewPort,
+        route: CameraOwnershipRoute = CameraOwnershipRoute.CAMERA_X_HANDOFF
+    ): CameraCaptureRuntimeCore {
+        val runtime = CameraCaptureRuntimeCore()
+        assertTrue(attach(runtime, preview, route) is PreviewAttachOutcome.Ready)
         preview.events.clear()
         return runtime
     }
 
+    private suspend fun attach(
+        runtime: CameraCaptureRuntimeCore,
+        preview: FakePreviewPort,
+        route: CameraOwnershipRoute = CameraOwnershipRoute.CAMERA_X_HANDOFF
+    ): PreviewAttachOutcome = runtime.attach(
+        route = route,
+        previewPort = preview,
+        frameSource = TestFrameSource,
+        attachment = TestAttachment
+    )
+
     private object TestAttachment : PreviewAttachment
+
+    private object TestFrameSource : CameraFrameSource {
+        override suspend fun captureFrame(
+            context: Context,
+            tracker: CaptureTimingTracker?,
+            diagnosticsTracker: FocusLensDiagnosticsTracker?,
+            focusTarget: FocusMeteringTarget
+        ): CopiedImageFrame = throw UnsupportedOperationException("Pure runtime test")
+
+        override fun resolveOutputRotationDegrees(context: Context): Int = 0
+
+        override fun resolveSensorOrientation(context: Context): Int = 90
+    }
 
     private class FakePreviewPort : PreviewLifecyclePort {
         val events = mutableListOf<String>()
         val invalidatedGenerations = mutableSetOf<Long>()
         val attachStarted = CompletableDeferred<Long>()
         var attachRelease: CompletableDeferred<Unit>? = null
+        var attachFailure: Throwable? = null
         var unbindFailure: Throwable? = null
         var rebindFailure: Throwable? = null
+        var onInvalidate: (() -> Unit)? = null
 
         override fun invalidate(generation: Long) {
+            onInvalidate?.invoke()
             invalidatedGenerations += generation
         }
 
@@ -281,6 +431,7 @@ class CameraCaptureRuntimeTest {
             if (invalidatedGenerations.contains(generation)) {
                 throw IllegalStateException("Stale attachment")
             }
+            attachFailure?.let { throw it }
             events += "bound:$generation"
         }
 
