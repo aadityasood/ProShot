@@ -94,7 +94,7 @@ internal class CameraCaptureRuntimeCore(
     private var activeCaptureJob: Job? = null
 
     @Volatile
-    private var synchronouslyInvalidatedGeneration: Long? = null
+    private var synchronouslyInvalidatedThroughGeneration = 0L
 
     @Volatile
     private var synchronouslyVisibleRecord: GenerationRouteRecord? = null
@@ -117,7 +117,8 @@ internal class CameraCaptureRuntimeCore(
         route: CameraOwnershipRoute,
         previewPort: PreviewLifecyclePort,
         frameSource: CameraFrameSource,
-        attachmentFactory: (Long) -> PreviewAttachment
+        attachmentFactory: (Long) -> PreviewAttachment,
+        onGenerationReserved: (Long) -> Unit = {}
     ): PreviewAttachOutcome {
         val callerJob = currentCoroutineContext()[Job]
         val transition = synchronized(stateLock) {
@@ -134,7 +135,7 @@ internal class CameraCaptureRuntimeCore(
             state = CameraRuntimeState.Attaching(record.generation)
             activeRecord = record
             activeAttachJob = callerJob
-            synchronouslyInvalidatedGeneration = null
+            markSynchronouslyInvalidatedThrough(record.generation - 1L)
             synchronouslyVisibleRecord = record
             mutablePreviewReady.value = false
             AttachmentTransition(
@@ -145,6 +146,32 @@ internal class CameraCaptureRuntimeCore(
             )
         }
 
+        try {
+            onGenerationReserved(transition.record.generation)
+        } catch (error: Throwable) {
+            cancelJobsBeforePortInvalidation(
+                attachJob = transition.previousAttachJob,
+                captureJob = transition.previousCaptureJob,
+                callerJob = callerJob,
+                attachMessage = "Camera attachment reservation failed",
+                captureMessage = "Camera attachment reservation failed during capture"
+            )
+            rejectAttachment(
+                record = transition.record,
+                callerJob = callerJob,
+                error = error,
+                previousRecordToRestore = transition.previousRecord
+            )
+            throw error
+        }
+
+        cancelJobsBeforePortInvalidation(
+            attachJob = transition.previousAttachJob,
+            captureJob = transition.previousCaptureJob,
+            callerJob = callerJob,
+            attachMessage = "Camera attachment was replaced",
+            captureMessage = "Camera attachment was replaced during capture"
+        )
         transition.previousRecord?.previewPort?.invalidate(
             transition.previousRecord.generation
         )
@@ -152,12 +179,34 @@ internal class CameraCaptureRuntimeCore(
         val attachment = try {
             attachmentFactory(transition.record.generation)
         } catch (error: Throwable) {
-            rejectAttachment(transition.record, callerJob, error)
+            rejectAttachment(
+                record = transition.record,
+                callerJob = callerJob,
+                error = error,
+                previousRecordToRestore = transition.previousRecord
+            )
             throw error
         }
 
         try {
             settlePreviousAttachment(transition)
+        } catch (error: Throwable) {
+            val wasCurrent = rejectAttachment(
+                record = transition.record,
+                callerJob = callerJob,
+                error = error,
+                previousRecordToRestore = transition.previousRecord
+            )
+            if (error is CancellationException) {
+                throw error
+            }
+            if (!wasCurrent) {
+                return PreviewAttachOutcome.Superseded
+            }
+            throw error
+        }
+
+        try {
             currentCoroutineContext().ensureActive()
             previewTransitionMutex.withLock {
                 transition.record.previewPort.attach(
@@ -166,7 +215,12 @@ internal class CameraCaptureRuntimeCore(
                 )
             }
         } catch (error: Throwable) {
-            val wasCurrent = rejectAttachment(transition.record, callerJob, error)
+            val wasCurrent = rejectAttachment(
+                record = transition.record,
+                callerJob = callerJob,
+                error = error,
+                previousRecordToRestore = null
+            )
             if (error is CancellationException) {
                 throw error
             }
@@ -180,7 +234,7 @@ internal class CameraCaptureRuntimeCore(
             val current = state
             if (current is CameraRuntimeState.Attaching &&
                 current.generation == transition.record.generation &&
-                synchronouslyInvalidatedGeneration != transition.record.generation
+                !isGenerationSynchronouslyInvalidated(transition.record.generation)
             ) {
                 state = CameraRuntimeState.Ready(transition.record.generation)
                 if (activeAttachJob === callerJob) {
@@ -216,26 +270,23 @@ internal class CameraCaptureRuntimeCore(
             } else {
                 state = CameraRuntimeState.Detaching(record.generation)
                 mutablePreviewReady.value = false
-                synchronouslyInvalidatedGeneration = record.generation
+                markSynchronouslyInvalidatedThrough(record.generation)
                 synchronouslyVisibleRecord = null
                 DetachTransition(record, activeAttachJob, activeCaptureJob)
             }
         } ?: return
 
-        transition.record.previewPort.invalidate(transition.record.generation)
         val callerJob = currentCoroutineContext()[Job]
+        cancelJobsBeforePortInvalidation(
+            attachJob = transition.attachJob,
+            captureJob = transition.captureJob,
+            callerJob = callerJob,
+            attachMessage = "Camera attachment was closed",
+            captureMessage = "Camera closed before capture completed"
+        )
+        transition.record.previewPort.invalidate(transition.record.generation)
         var detachFailure: Throwable? = null
         withContext(NonCancellable) {
-            if (transition.attachJob !== callerJob) {
-                transition.attachJob?.cancel(
-                    CancellationException("Camera attachment was closed")
-                )
-            }
-            if (transition.captureJob !== callerJob) {
-                transition.captureJob?.cancel(
-                    CancellationException("Camera closed before capture completed")
-                )
-            }
             previewTransitionMutex.withLock {
                 try {
                     transition.record.previewPort.detach(transition.record.generation)
@@ -265,26 +316,30 @@ internal class CameraCaptureRuntimeCore(
                 }
                 mutablePreviewReady.value =
                     state is CameraRuntimeState.Ready &&
-                    synchronouslyInvalidatedGeneration != state.generation
+                    !isGenerationSynchronouslyInvalidated(state.generation)
             }
         }
         detachFailure?.let { throw it }
     }
 
     /**
-     * Immediately invalidates and closes a physical owner without bypassing a
-     * contended coroutine mutex. Structured coroutine cleanup follows separately.
+     * Immediately invalidates readiness and cancels jobs without clearing the logical
+     * retained record needed for subsequent suspending settlement during replacement attach.
      */
     fun detachSync(expectedGeneration: Long) {
         val transition = synchronized(stateLock) {
             val record = activeRecord
-            if (record == null || record.generation != expectedGeneration) {
+            if (record == null ||
+                record.generation != expectedGeneration ||
+                isGenerationSynchronouslyInvalidated(expectedGeneration)
+            ) {
                 null
             } else {
-                synchronouslyInvalidatedGeneration = expectedGeneration
+                markSynchronouslyInvalidatedThrough(expectedGeneration)
                 synchronouslyVisibleRecord = null
-                state = CameraRuntimeState.Detached(expectedGeneration)
-                activeRecord = null
+                if (state !is CameraRuntimeState.PreviewUnavailable) {
+                    state = CameraRuntimeState.Detaching(expectedGeneration)
+                }
                 mutablePreviewReady.value = false
                 DetachTransition(record, activeAttachJob, activeCaptureJob).also {
                     activeAttachJob = null
@@ -303,28 +358,35 @@ internal class CameraCaptureRuntimeCore(
     }
 
     /** Records a terminal physical-port failure for the matching generation. */
-    fun onPortTerminated(generation: Long, error: Throwable) {
+    fun onPortTerminated(generation: Long, error: Throwable): Boolean {
         val jobs = synchronized(stateLock) {
             val record = activeRecord
-            if (record == null || record.generation != generation) {
+            if (record == null ||
+                record.generation != generation ||
+                isGenerationSynchronouslyInvalidated(generation)
+            ) {
                 null
             } else {
-                synchronouslyInvalidatedGeneration = generation
+                markSynchronouslyInvalidatedThrough(generation)
                 synchronouslyVisibleRecord = null
                 state = CameraRuntimeState.PreviewUnavailable(generation)
-                activeRecord = null
                 mutablePreviewReady.value = false
                 (activeAttachJob to activeCaptureJob).also {
                     activeAttachJob = null
                     activeCaptureJob = null
                 }
             }
-        } ?: return
+        } ?: return false
 
         jobs.first?.cancel(cancellationException("Camera preview terminated", error))
         jobs.second?.cancel(cancellationException("Camera capture owner terminated", error))
         errorReporter.report("Camera preview owner terminated", error)
+        return true
     }
+
+    /** Returns whether the exact generation has already lost synchronous runtime ownership. */
+    fun isGenerationSynchronouslyInvalidated(generation: Long): Boolean =
+        generation <= synchronouslyInvalidatedThroughGeneration
 
     suspend fun capture(
         isDebug: Boolean,
@@ -349,7 +411,7 @@ internal class CameraCaptureRuntimeCore(
                 if (current is CameraRuntimeState.Ready &&
                     active != null &&
                     current.generation == active.generation &&
-                    synchronouslyInvalidatedGeneration != active.generation
+                    !isGenerationSynchronouslyInvalidated(active.generation)
                 ) {
                     state = CameraRuntimeState.Capturing(active.generation)
                     activeCaptureJob = callerJob
@@ -378,7 +440,7 @@ internal class CameraCaptureRuntimeCore(
                     val current = state
                     current is CameraRuntimeState.Capturing &&
                         current.generation == captureRecord.generation &&
-                        synchronouslyInvalidatedGeneration != captureRecord.generation
+                        !isGenerationSynchronouslyInvalidated(captureRecord.generation)
                 }
                 if (!stillCurrent) {
                     throw CancellationException("Camera closed before capture started")
@@ -404,7 +466,7 @@ internal class CameraCaptureRuntimeCore(
                                 val current = state
                                 if (current is CameraRuntimeState.Capturing &&
                                     current.generation == captureRecord.generation &&
-                                    synchronouslyInvalidatedGeneration != captureRecord.generation
+                                    !isGenerationSynchronouslyInvalidated(captureRecord.generation)
                                 ) {
                                     state = CameraRuntimeState.Rebinding(captureRecord.generation)
                                     true
@@ -448,7 +510,7 @@ internal class CameraCaptureRuntimeCore(
                             val current = state
                             if (current is CameraRuntimeState.Capturing &&
                                 current.generation == captureRecord.generation &&
-                                synchronouslyInvalidatedGeneration != captureRecord.generation
+                                !isGenerationSynchronouslyInvalidated(captureRecord.generation)
                             ) {
                                 state = CameraRuntimeState.Ready(captureRecord.generation)
                             }
@@ -462,7 +524,7 @@ internal class CameraCaptureRuntimeCore(
                         val current = state
                         mutablePreviewReady.value =
                             current is CameraRuntimeState.Ready &&
-                            synchronouslyInvalidatedGeneration != current.generation
+                            !isGenerationSynchronouslyInvalidated(current.generation)
                     }
                 }
             }
@@ -474,6 +536,14 @@ internal class CameraCaptureRuntimeCore(
         }
 
         cancellation?.let { throw it }
+        currentCoroutineContext().ensureActive()
+        record?.let { captureRecord ->
+            if (isGenerationSynchronouslyInvalidated(captureRecord.generation)) {
+                throw CancellationException(
+                    "Camera generation was invalidated before capture completed"
+                )
+            }
+        }
         val captureResult = result
             ?: CaptureResult.Failure("Camera could not take a photo. Please try again.")
         return withPreviewRecovery(captureResult, rebindFailure)
@@ -520,17 +590,23 @@ internal class CameraCaptureRuntimeCore(
     private suspend fun rejectAttachment(
         record: GenerationRouteRecord,
         callerJob: Job?,
-        error: Throwable
+        error: Throwable,
+        previousRecordToRestore: GenerationRouteRecord? = null
     ): Boolean {
         val wasCurrent = synchronized(stateLock) {
             val current = state
             if (current is CameraRuntimeState.Attaching &&
                 current.generation == record.generation
             ) {
-                state = CameraRuntimeState.Detached(record.generation)
-                activeRecord = null
+                if (previousRecordToRestore != null) {
+                    state = CameraRuntimeState.PreviewUnavailable(previousRecordToRestore.generation)
+                    activeRecord = previousRecordToRestore
+                } else {
+                    state = CameraRuntimeState.Detached(record.generation)
+                    activeRecord = null
+                }
+                markSynchronouslyInvalidatedThrough(record.generation)
                 synchronouslyVisibleRecord = null
-                synchronouslyInvalidatedGeneration = record.generation
                 if (activeAttachJob === callerJob) {
                     activeAttachJob = null
                 }
@@ -557,6 +633,27 @@ internal class CameraCaptureRuntimeCore(
             errorReporter.report("Failed to attach camera preview", error)
         }
         return wasCurrent
+    }
+
+    private fun cancelJobsBeforePortInvalidation(
+        attachJob: Job?,
+        captureJob: Job?,
+        callerJob: Job?,
+        attachMessage: String,
+        captureMessage: String
+    ) {
+        if (attachJob !== callerJob) {
+            attachJob?.cancel(CancellationException(attachMessage))
+        }
+        if (captureJob !== callerJob) {
+            captureJob?.cancel(CancellationException(captureMessage))
+        }
+    }
+
+    private fun markSynchronouslyInvalidatedThrough(generation: Long) {
+        if (generation > synchronouslyInvalidatedThroughGeneration) {
+            synchronouslyInvalidatedThroughGeneration = generation
+        }
     }
 
     private fun clearVisibleRecordIfMatching(record: GenerationRouteRecord) {

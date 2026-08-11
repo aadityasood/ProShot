@@ -54,10 +54,19 @@ coroutine generation/capture state machine, while `CameraCaptureRuntime.kt`
 retains the Activity-retained Android/Hilt facade. Its generation-based
 lifecycle state machine covers detached, attaching, ready, capturing,
 rebinding, and detaching states.
-Route policy (`CameraOwnershipRoutePolicy`) selects `PERSISTENT_CAMERA2` for
-debuggable builds and `CAMERA_X_HANDOFF` for release builds. For the persistent direct
-Camera2 route, capture executes `Ready -> Capturing -> Ready` with zero unbind/rebind
-calls; for the CameraX handoff route, capture performs one unbind and one rebind.
+Route policy (`CameraOwnershipRoutePolicy`) resolves initial candidate routes from build type and hardware capabilities:
+- `PERSISTENT_CAMERA2` is selected for debuggable builds when camera availability and YUV capture capabilities permit.
+- `CAMERA_X_HANDOFF` is selected for release builds or when direct capabilities are absent.
+
+Upon eligible direct Camera2 route failure, the architecture executes a one-way atomic fallback to `CAMERA_X_HANDOFF` for the remaining screen lifetime. Retained logical records and callback-before-close ordering enforce a fail-closed old-owner terminal barrier before replacement attachment opens a device.
+The Activity-retained runtime latches that fallback synchronously before notifying
+the disposable preview host, and Compose applies the latch before constructing a
+host after configuration recreation. Each direct attach also publishes its newly
+reserved generation to the host before port attachment can publish a physical
+owner. Lifecycle and replacement transitions cancel matching generation jobs
+before port invalidation can begin physical close.
+
+For the persistent direct Camera2 route, capture executes `Ready -> Capturing -> Ready` with zero unbind/rebind calls; for the CameraX handoff route, capture performs one unbind and one rebind.
 Initial preview attachment is awaited before readiness is exposed to the UI.
 A fail-fast coroutine mutex covers the complete capture transaction; concurrent
 requests return a stable busy result without extra work.
@@ -85,7 +94,11 @@ requests return a stable busy result without extra work.
   the `TextureView`-owned `SurfaceTexture` is never released by the owner.
   The callback looper remains available for the exact accepted device's
   `onClosed` acknowledgement, with a bounded timeout, and replacement attach
-  waits for callback-thread termination before opening another device.
+  waits for callback-thread termination before opening another device. If owner
+  construction fails after its callback thread starts, the factory closes the
+  pre-open reader and preview wrapper, requests safe looper termination, and
+  performs a bounded join; unproven thread death is a terminal barrier that
+  prevents ordinary fallback.
 
 Compose UI (`CameraScreen`) selects exactly one route before constructing a
 preview host. The CameraX branch owns one `PreviewView`; the direct branch owns
