@@ -277,7 +277,7 @@ OpenCV target.
 |:---|:---|:---|:---|
 | CameraX core, Camera2 adapter, lifecycle, and view | Stable `1.6.1` catalog value | `IMPLEMENTED` | Preview and lifecycle binding |
 | Camera2 platform API | Android platform | `IMPLEMENTED` | Still capture and pre-capture control |
-| Jetpack Compose and Material3 | Compose BOM `2025.08.00` | `IMPLEMENTED` | Camera UI and debug overlay |
+| Jetpack Compose and Material3, Lifecycle Compose | Compose BOM `2025.08.00` | `IMPLEMENTED` | Camera UI and debug overlay; owns lifecycle-owner access |
 | Hilt | `2.54` catalog value | `IMPLEMENTED` | Bootstrap plus camera runtime, controller, resource-factory, and session-creator injection |
 | CameraX Extensions | `1.6.1` catalog value | `DECLARED/CONFIGURED` | Dependency declared; no extension route |
 | TensorFlow Lite and GPU delegate | `2.16.1` catalog value | `DECLARED/CONFIGURED` | Dependencies declared; no model loading or inference |
