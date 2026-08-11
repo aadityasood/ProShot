@@ -53,19 +53,20 @@ internal class AndroidDisplayRotationSource(
     }
 
     override fun observeDisplayChanges(
-        onDisplayEvent: (displayId: Int) -> Unit
+        onDisplayChanged: (displayId: Int) -> Unit
     ): DisplayRotationSubscription {
+        val notifyDisplayChanged = onDisplayChanged
         val listener = object : DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) {
-                onDisplayEvent(displayId)
+                notifyDisplayChanged(displayId)
             }
 
             override fun onDisplayRemoved(displayId: Int) {
-                onDisplayEvent(displayId)
+                notifyDisplayChanged(displayId)
             }
 
             override fun onDisplayChanged(displayId: Int) {
-                onDisplayEvent(displayId)
+                notifyDisplayChanged(displayId)
             }
         }
         displayManager.registerDisplayListener(listener, mainHandler)

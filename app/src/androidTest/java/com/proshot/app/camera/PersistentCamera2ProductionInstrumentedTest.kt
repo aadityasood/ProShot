@@ -219,7 +219,7 @@ class PersistentCamera2ProductionInstrumentedTest {
 
             composeRule.setContent {
                 visualContext.set(androidx.compose.ui.platform.LocalContext.current)
-                val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
                 if (showHost.value) {
                     when (activeRoute.value) {
                         CameraOwnershipRoute.PERSISTENT_CAMERA2 -> {
