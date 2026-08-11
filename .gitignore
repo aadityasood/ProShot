@@ -12,6 +12,7 @@
 .kotlin/
 /build
 /app/build
+/tools/image-quality/build/
 /captures
 .externalNativeBuild
 .cxx

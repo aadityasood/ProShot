@@ -244,6 +244,31 @@ single-frame capture controller, unscoped per-capture resource-owner factories,
 and the singleton session-creation boundary are constructor-injected or
 Hilt-bound. Other processing and output services are not yet fully injected.
 
+### Offline Image-Quality Harness (Tool)
+
+The offline image-quality harness is `IMPLEMENTED` as a standalone, dependency-
+light Kotlin/JVM CLI module under `tools/image-quality/`. It is a public,
+local-first evidence tool: it validates private datasets, blinds source-neutral
+reviewer packages, seals reviewer responses before unblinding, produces
+reproducible calibration reports and locked threshold artifacts, and supports
+`validate`, `blind`, `seal-review`, `analyze`, and `lock-thresholds` commands.
+It runs entirely offline with no network access, telemetry, uploads, or Git
+invocation, and it depends only on Kotlin/JDK standard APIs and Java desktop
+`ImageIO`. Tests generate temporary synthetic images and data only.
+
+Boundaries:
+
+- The tool is outside the Android runtime. It performs no capture, processing,
+  output, UI, or saved-photograph improvement.
+- It stores no public corpus of photographs; private originals, keys,
+  responses, reports, and thresholds remain under the already ignored
+  `reference-captures/` root or outside the repository.
+- It implements no advanced image-quality metric in this slice; sharpness,
+  noise, motion, Delta E, PSNR, SSIM, LPIPS, MTF, and similar metrics report
+  `UNAVAILABLE_NOT_IMPLEMENTED`.
+- It supports no competitor or universal-device claim; calibration without a
+  validly locked threshold remains `INCONCLUSIVE / CALIBRATION`.
+
 ## Data Models
 
 `CopiedImageFrame` is `IMPLEMENTED`. It stores:

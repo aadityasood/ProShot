@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ProShot"
 include(":app")
+include(":tools:image-quality")
