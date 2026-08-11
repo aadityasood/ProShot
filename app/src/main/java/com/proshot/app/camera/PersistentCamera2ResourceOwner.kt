@@ -23,6 +23,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 private const val TAG = "PersistentCamera2ResourceOwner"
 private const val DEVICE_CLOSE_ACK_TIMEOUT_MS = 1_000L
 private const val OWNER_CLOSE_WAIT_TIMEOUT_MS = 2_500L
+private const val CONSTRUCTION_THREAD_JOIN_TIMEOUT_MS = 1_500L
 
 private object PersistentMainLooperTerminalActionScheduler : TerminalActionScheduler {
     private val handler by lazy { Handler(Looper.getMainLooper()) }
@@ -69,6 +70,76 @@ internal class PersistentOwnerCloseCoordinator(
 /** Exact terminal failure raised when persistent-owner close wins submission. */
 internal class PersistentCamera2OwnerClosedException :
     IllegalStateException("Persistent Camera2 owner is closing")
+
+/** Construction failed and bounded callback-thread death could not be proved. */
+internal class PersistentCamera2ConstructionBarrierException(
+    constructionCause: Exception
+) : IllegalStateException(
+    "Persistent Camera2 callback thread survived construction cleanup",
+    constructionCause
+)
+
+/**
+ * Generic construction cleanup seam. Resource cleanup never replaces the original
+ * failure, and an ordinary [Exception] cannot escape while a started thread remains
+ * unproven. The production join is invoked from the controller's Default dispatcher.
+ */
+internal fun <Reader, PreviewSurface, CallbackThread> throwAfterPersistentConstructionFailure(
+    constructionFailure: Throwable,
+    reader: Reader,
+    previewSurface: PreviewSurface,
+    callbackThread: CallbackThread?,
+    closeReader: (Reader) -> Unit,
+    releasePreviewSurface: (PreviewSurface) -> Unit,
+    quitSafely: (CallbackThread) -> Unit,
+    joinBounded: (CallbackThread, Long) -> Unit,
+    isThreadAlive: (CallbackThread) -> Boolean,
+    joinTimeoutMs: Long = CONSTRUCTION_THREAD_JOIN_TIMEOUT_MS
+): Nothing {
+    val cleanupFailures = mutableListOf<Throwable>()
+
+    fun attempt(step: () -> Unit) {
+        try {
+            step()
+        } catch (failure: Throwable) {
+            cleanupFailures += failure
+        }
+    }
+
+    attempt { closeReader(reader) }
+    attempt { releasePreviewSurface(previewSurface) }
+
+    val threadDeathProved = if (callbackThread == null) {
+        true
+    } else {
+        attempt { quitSafely(callbackThread) }
+        attempt { joinBounded(callbackThread, joinTimeoutMs) }
+        try {
+            !isThreadAlive(callbackThread)
+        } catch (failure: Throwable) {
+            cleanupFailures += failure
+            false
+        }
+    }
+
+    cleanupFailures.forEach { cleanupFailure ->
+        if (cleanupFailure !== constructionFailure) {
+            constructionFailure.addSuppressed(cleanupFailure)
+        }
+    }
+
+    if (!threadDeathProved) {
+        if (constructionFailure is Exception) {
+            throw PersistentCamera2ConstructionBarrierException(constructionFailure)
+        }
+        constructionFailure.addSuppressed(
+            IllegalStateException(
+                "Persistent Camera2 callback thread death was not proved after construction failure"
+            )
+        )
+    }
+    throw constructionFailure
+}
 
 /** Synchronous boundary around one Camera2 request construction and submission. */
 internal interface Camera2RequestSubmissionGate {
@@ -376,9 +447,8 @@ class PersistentCamera2ResourceOwnerFactory @Inject constructor() {
 
         var callbackThread: HandlerThread? = null
         try {
-            callbackThread = HandlerThread(
-                "PersistentCamera2ResourceOwnerThread"
-            ).apply { start() }
+            callbackThread = HandlerThread("PersistentCamera2ResourceOwnerThread")
+            callbackThread.start()
             val handler = Handler(callbackThread.looper)
             return PersistentCamera2ResourceOwner(
                 surfaceTexture = surfaceTexture,
@@ -389,18 +459,20 @@ class PersistentCamera2ResourceOwnerFactory @Inject constructor() {
                 handler = handler
             )
         } catch (error: Throwable) {
-            try {
-                imageReader.close()
-            } catch (_: Exception) {
-                // Preserve the construction failure.
-            }
-            try {
-                previewSurface.release()
-            } catch (_: Exception) {
-                // Preserve the construction failure.
-            }
-            callbackThread?.takeIf { it.isAlive }?.quitSafely()
-            throw error
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = error,
+                reader = imageReader,
+                previewSurface = previewSurface,
+                callbackThread = callbackThread,
+                closeReader = ImageReader::close,
+                releasePreviewSurface = Surface::release,
+                quitSafely = { thread ->
+                    thread.quitSafely()
+                    Unit
+                },
+                joinBounded = { thread, timeoutMs -> thread.join(timeoutMs) },
+                isThreadAlive = { thread -> thread.isAlive }
+            )
         }
     }
 }

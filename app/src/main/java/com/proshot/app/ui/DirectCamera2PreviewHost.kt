@@ -37,6 +37,7 @@ internal fun DirectCamera2PreviewHost(
     displayRotationDegrees: Int,
     onTransformChanged: (DirectPreviewTransform?) -> Unit,
     onCameraError: (String) -> Unit,
+    onDirectRouteFailure: (com.proshot.app.camera.DirectCamera2Failure) -> Unit = {},
     modifier: Modifier = Modifier,
     onPreviewFrame: () -> Unit = {},
     onRenderTransformApplied: (TextureViewRenderTransform) -> Unit = {}
@@ -46,6 +47,7 @@ internal fun DirectCamera2PreviewHost(
     val textureView = remember(context) { TextureView(context) }
     val configuration by cameraCaptureRuntime.directPreviewConfiguration.collectAsState()
     val currentOnCameraError by rememberUpdatedState(onCameraError)
+    val currentOnDirectRouteFailure by rememberUpdatedState(onDirectRouteFailure)
     val currentOnTransformChanged by rememberUpdatedState(onTransformChanged)
     val currentOnPreviewFrame by rememberUpdatedState(onPreviewFrame)
     val currentOnRenderTransformApplied by rememberUpdatedState(onRenderTransformApplied)
@@ -144,24 +146,30 @@ internal fun DirectCamera2PreviewHost(
 
         var generation: Long? = null
         try {
-            generation = cameraCaptureRuntime.attachDirect(
+            val attachedGeneration = cameraCaptureRuntime.attachDirect(
                 surfaceTexture = currentSurface,
                 width = viewSize.width,
                 height = viewSize.height,
-                onTerminalError = {
+                onGenerationReserved = { reservedGeneration ->
+                    generation = reservedGeneration
+                    activeGeneration = reservedGeneration
+                },
+                onTerminalError = { failure ->
                     textureView.post {
-                        currentOnCameraError(
-                            "Direct Camera2 preview stopped. Please retry."
-                        )
+                        currentOnDirectRouteFailure(failure)
                     }
                 }
             )
-            activeGeneration = generation
-            if (generation != null) {
+            if (attachedGeneration != null) {
+                check(generation == attachedGeneration) {
+                    "Direct attachment returned without publishing its reserved generation"
+                }
                 awaitCancellation()
             }
         } catch (error: CancellationException) {
             throw error
+        } catch (error: com.proshot.app.camera.DirectCamera2RouteException) {
+            currentOnDirectRouteFailure(error.failure)
         } catch (error: Exception) {
             currentOnCameraError("Direct Camera2 preview failed. Please retry.")
         } finally {

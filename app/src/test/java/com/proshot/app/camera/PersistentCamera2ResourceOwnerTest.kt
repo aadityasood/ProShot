@@ -5,10 +5,201 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PersistentCamera2ResourceOwnerTest {
+
+    @Test
+    fun constructionCleanup_noStartedThread_preservesOriginalAndSkipsThreadActions() {
+        val original = IllegalStateException("construction")
+        val thread: FakeConstructionThread? = null
+        var readerCloseCount = 0
+        var surfaceReleaseCount = 0
+        var quitCount = 0
+        var joinCount = 0
+
+        val failure = runCatching {
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = original,
+                reader = "reader",
+                previewSurface = "surface",
+                callbackThread = thread,
+                closeReader = { readerCloseCount++ },
+                releasePreviewSurface = { surfaceReleaseCount++ },
+                quitSafely = { quitCount++ },
+                joinBounded = { _, _ -> joinCount++ },
+                isThreadAlive = { it.alive }
+            )
+        }.exceptionOrNull()
+
+        assertSame(original, failure)
+        assertEquals(1, readerCloseCount)
+        assertEquals(1, surfaceReleaseCount)
+        assertEquals(0, quitCount)
+        assertEquals(0, joinCount)
+    }
+
+    @Test
+    fun constructionCleanup_startedThread_quitsAndJoinsToProvenDeath() {
+        val original = IllegalStateException("construction")
+        val thread = FakeConstructionThread(alive = true)
+        var joinedWith = 0L
+
+        val failure = runCatching {
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = original,
+                reader = "reader",
+                previewSurface = "surface",
+                callbackThread = thread,
+                closeReader = { thread.readerCloseCount++ },
+                releasePreviewSurface = { thread.surfaceReleaseCount++ },
+                quitSafely = { it.quitCount++ },
+                joinBounded = { target, timeoutMs ->
+                    target.joinCount++
+                    target.alive = false
+                    joinedWith = timeoutMs
+                },
+                isThreadAlive = { it.alive },
+                joinTimeoutMs = 23L
+            )
+        }.exceptionOrNull()
+
+        assertSame(original, failure)
+        assertEquals(1, thread.readerCloseCount)
+        assertEquals(1, thread.surfaceReleaseCount)
+        assertEquals(1, thread.quitCount)
+        assertEquals(1, thread.joinCount)
+        assertEquals(23L, joinedWith)
+        assertFalse(thread.alive)
+    }
+
+    @Test
+    fun constructionCleanup_startedThreadStillAlive_raisesDistinctBarrier() {
+        val original = IllegalStateException("construction")
+        val thread = FakeConstructionThread(alive = true)
+
+        val failure = runCatching {
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = original,
+                reader = "reader",
+                previewSurface = "surface",
+                callbackThread = thread,
+                closeReader = { thread.readerCloseCount++ },
+                releasePreviewSurface = { thread.surfaceReleaseCount++ },
+                quitSafely = { it.quitCount++ },
+                joinBounded = { target, _ -> target.joinCount++ },
+                isThreadAlive = { it.alive }
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is PersistentCamera2ConstructionBarrierException)
+        assertSame(original, failure?.cause)
+        assertEquals(1, thread.readerCloseCount)
+        assertEquals(1, thread.surfaceReleaseCount)
+        assertEquals(1, thread.quitCount)
+        assertEquals(1, thread.joinCount)
+    }
+
+    @Test
+    fun constructionFailureClassification_neverTreatsBarrierAsFallbackEligibleUnsupported() {
+        val cause = IllegalStateException("construction")
+
+        assertEquals(
+            DirectCamera2FailureKind.OWNER_TERMINAL_BARRIER,
+            classifyPersistentOwnerConstructionFailure(
+                PersistentCamera2ConstructionBarrierException(cause)
+            )
+        )
+        assertEquals(
+            DirectCamera2FailureKind.PERMISSION_OR_SECURITY,
+            classifyPersistentOwnerConstructionFailure(SecurityException("permission"))
+        )
+        assertEquals(
+            DirectCamera2FailureKind.UNSUPPORTED_CONFIGURATION,
+            classifyPersistentOwnerConstructionFailure(cause)
+        )
+    }
+
+    @Test
+    fun constructionCleanup_cleanupFailuresAreSuppressedAndEveryStepRunsOnce() {
+        val original = IllegalStateException("construction")
+        val readerFailure = IllegalArgumentException("reader close")
+        val surfaceFailure = IllegalArgumentException("surface release")
+        val thread = FakeConstructionThread(alive = true)
+
+        val failure = runCatching {
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = original,
+                reader = "reader",
+                previewSurface = "surface",
+                callbackThread = thread,
+                closeReader = {
+                    thread.readerCloseCount++
+                    throw readerFailure
+                },
+                releasePreviewSurface = {
+                    thread.surfaceReleaseCount++
+                    throw surfaceFailure
+                },
+                quitSafely = { it.quitCount++ },
+                joinBounded = { target, _ ->
+                    target.joinCount++
+                    target.alive = false
+                },
+                isThreadAlive = { it.alive }
+            )
+        }.exceptionOrNull()
+
+        assertSame(original, failure)
+        assertEquals(listOf(readerFailure, surfaceFailure), original.suppressed.toList())
+        assertEquals(1, thread.readerCloseCount)
+        assertEquals(1, thread.surfaceReleaseCount)
+        assertEquals(1, thread.quitCount)
+        assertEquals(1, thread.joinCount)
+    }
+
+    @Test
+    fun constructionCleanup_fatalIdentitySurvivesUnprovenThreadWithSuppressedFailures() {
+        val fatal = AssertionError("fatal construction")
+        val quitFailure = IllegalStateException("quit failed")
+        val joinFailure = IllegalStateException("join failed")
+        val thread = FakeConstructionThread(alive = true)
+
+        val failure = runCatching {
+            throwAfterPersistentConstructionFailure(
+                constructionFailure = fatal,
+                reader = "reader",
+                previewSurface = "surface",
+                callbackThread = thread,
+                closeReader = { thread.readerCloseCount++ },
+                releasePreviewSurface = { thread.surfaceReleaseCount++ },
+                quitSafely = {
+                    it.quitCount++
+                    throw quitFailure
+                },
+                joinBounded = { target, _ ->
+                    target.joinCount++
+                    throw joinFailure
+                },
+                isThreadAlive = { it.alive }
+            )
+        }.exceptionOrNull()
+
+        assertSame(fatal, failure)
+        assertTrue(fatal.suppressed.contains(quitFailure))
+        assertTrue(fatal.suppressed.contains(joinFailure))
+        assertTrue(
+            fatal.suppressed.any {
+                it.message?.contains("thread death was not proved") == true
+            }
+        )
+        assertEquals(1, thread.readerCloseCount)
+        assertEquals(1, thread.surfaceReleaseCount)
+        assertEquals(1, thread.quitCount)
+        assertEquals(1, thread.joinCount)
+    }
 
     @Test
     fun closeCoordinator_clearsListenerBeforeRouterGateAndSurfaceExactlyOnce() {
@@ -246,4 +437,12 @@ class PersistentCamera2ResourceOwnerTest {
             checkNotNull(action).invoke()
         }
     }
+
+    private data class FakeConstructionThread(
+        var alive: Boolean,
+        var readerCloseCount: Int = 0,
+        var surfaceReleaseCount: Int = 0,
+        var quitCount: Int = 0,
+        var joinCount: Int = 0
+    )
 }

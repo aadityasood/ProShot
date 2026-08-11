@@ -216,8 +216,29 @@ private fun ActivePreviewContent(
     val isDebugBuild = remember(context) {
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     }
-    val ownershipRoute = remember(isDebugBuild) {
-        com.proshot.app.camera.CameraOwnershipRoutePolicy.select(isDebugBuild)
+    var routeStateName by rememberSaveable {
+        mutableStateOf(com.proshot.app.camera.CameraOwnershipRouteState.PENDING.name)
+    }
+    val routeState = remember(routeStateName) {
+        com.proshot.app.camera.CameraOwnershipRouteState.parse(routeStateName)
+    }
+    val retainedFallbackMandatory by
+        cameraCaptureRuntime.isCameraXFallbackMandatory.collectAsState()
+    val effectiveRouteState = remember(routeState, retainedFallbackMandatory) {
+        com.proshot.app.camera.CameraOwnershipRoutePolicy.applyRetainedFallback(
+            currentState = routeState,
+            isFallbackMandatory = retainedFallbackMandatory
+        )
+    }
+    val activeRoute = effectiveRouteState.route
+
+    LaunchedEffect(effectiveRouteState.name) {
+        if (effectiveRouteState ==
+            com.proshot.app.camera.CameraOwnershipRouteState.FALLBACK_CAMERAX &&
+            routeStateName != effectiveRouteState.name
+        ) {
+            routeStateName = effectiveRouteState.name
+        }
     }
 
     var isCapturing by remember { mutableStateOf(false) }
@@ -258,7 +279,7 @@ private fun ActivePreviewContent(
 
     val onShutterPressed = {
         val activeDecision = capabilityState?.second
-        val isReady = !isCapturing && isPreviewReady && activeDecision != null
+        val isReady = !isCapturing && isPreviewReady && activeDecision != null && activeRoute != null
         if (isReady) {
             isCapturing = true
             focusStatusMessage = ""
@@ -339,17 +360,59 @@ private fun ActivePreviewContent(
     }
 
     LaunchedEffect(context) {
-        capabilityState = withContext(Dispatchers.IO) {
-            val capabilities = CameraCapabilitiesMapper.map(context)
-            val decision = CompatibilityPolicy.select(capabilities)
-            capabilities to decision
+        val (capabilities, decision) = withContext(Dispatchers.IO) {
+            val caps = CameraCapabilitiesMapper.map(context)
+            val dec = CompatibilityPolicy.select(caps)
+            caps to dec
+        }.also { capabilityState = it }
+
+        val currentSavedState = com.proshot.app.camera.CameraOwnershipRouteState.parse(
+            routeStateName
+        )
+        val currentEffectiveState =
+            com.proshot.app.camera.CameraOwnershipRoutePolicy.applyRetainedFallback(
+                currentState = currentSavedState,
+                isFallbackMandatory = cameraCaptureRuntime
+                    .isCameraXFallbackMandatory.value
+            )
+        if (currentEffectiveState ==
+            com.proshot.app.camera.CameraOwnershipRouteState.PENDING
+        ) {
+            val initialState = com.proshot.app.camera.CameraOwnershipRoutePolicy.selectInitialState(
+                isDebuggable = isDebugBuild,
+                cameraAvailable = capabilities.cameraAvailable,
+                yuvCaptureSupported = capabilities.yuvCaptureSupported
+            )
+            routeStateName = com.proshot.app.camera.CameraOwnershipRoutePolicy
+                .applyRetainedFallback(
+                    currentState = initialState,
+                    isFallbackMandatory = cameraCaptureRuntime
+                        .isCameraXFallbackMandatory.value
+                ).name
+        } else if (currentEffectiveState != currentSavedState) {
+            routeStateName = currentEffectiveState.name
         }
+
         sensorOrientationDegrees = withContext(Dispatchers.IO) {
             try {
                 cameraCaptureRuntime.resolveSensorOrientation(context)
             } catch (_: Exception) {
                 90
             }
+        }
+    }
+
+    val onDirectRouteFailure: (com.proshot.app.camera.DirectCamera2Failure) -> Unit = { failure ->
+        val nextState = com.proshot.app.camera.CameraOwnershipRoutePolicy.reduceDirectFailure(
+            currentState = effectiveRouteState,
+            failure = failure
+        )
+        if (nextState ==
+            com.proshot.app.camera.CameraOwnershipRouteState.FALLBACK_CAMERAX
+        ) {
+            routeStateName = nextState.name
+        } else if (failure.kind != com.proshot.app.camera.DirectCamera2FailureKind.LIFECYCLE_OR_SUPERSESSION) {
+            onCameraError("Direct Camera2 preview failed. Please retry.")
         }
     }
 
@@ -367,16 +430,15 @@ private fun ActivePreviewContent(
             displayRotationDegrees = displayRotation
         )
 
-        if (ownershipRoute ==
-            com.proshot.app.camera.CameraOwnershipRoute.PERSISTENT_CAMERA2
-        ) {
+        if (activeRoute == com.proshot.app.camera.CameraOwnershipRoute.PERSISTENT_CAMERA2) {
             DirectCamera2PreviewHost(
                 cameraCaptureRuntime = cameraCaptureRuntime,
                 displayRotationDegrees = displayRotation,
                 onTransformChanged = { directPreviewTransform = it },
-                onCameraError = onCameraError
+                onCameraError = onCameraError,
+                onDirectRouteFailure = onDirectRouteFailure
             )
-        } else {
+        } else if (activeRoute == com.proshot.app.camera.CameraOwnershipRoute.CAMERA_X_HANDOFF) {
             val previewView = remember(context) {
                 PreviewView(context).apply {
                     scaleType = PreviewView.ScaleType.FILL_CENTER
@@ -426,7 +488,7 @@ private fun ActivePreviewContent(
                 .pointerInput(
                     isCapturing,
                     isPreviewReady,
-                    ownershipRoute,
+                    activeRoute,
                     directPreviewTransform
                 ) {
                     detectTapGestures { offset ->
@@ -435,7 +497,7 @@ private fun ActivePreviewContent(
                             size.width > 0 &&
                             size.height > 0
                         ) {
-                            val target = if (ownershipRoute ==
+                            val target = if (activeRoute ==
                                 com.proshot.app.camera.CameraOwnershipRoute.PERSISTENT_CAMERA2
                             ) {
                                 directPreviewTransform?.mapTapToSensorTarget(

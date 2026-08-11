@@ -8,7 +8,9 @@ import androidx.lifecycle.LifecycleOwner
 import com.proshot.app.processing.style.LookProfile
 import dagger.hilt.android.scopes.ActivityRetainedScoped
 import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 
 private const val TAG = "CameraCaptureRuntime"
@@ -17,6 +19,54 @@ internal data class AndroidPreviewAttachment(
     val lifecycleOwner: LifecycleOwner,
     val previewView: PreviewView
 ) : PreviewAttachment
+
+/** Activity-retained monotonic authority for mandatory CameraX fallback. */
+internal class RetainedCameraXFallbackLatch {
+    private val mutableMandatory = MutableStateFlow(false)
+
+    val mandatory: StateFlow<Boolean> = mutableMandatory.asStateFlow()
+
+    fun latchIfEligible(failure: DirectCamera2Failure) {
+        if (failure.kind.isEligibleForFallback) {
+            mutableMandatory.value = true
+        }
+    }
+}
+
+/**
+ * Linearizes lifecycle invalidation against a retained direct terminal failure.
+ * A failed terminal claim is treated as lifecycle/supersession and never latches fallback.
+ */
+internal fun handleDirectTerminalFailure(
+    generation: Long,
+    failure: DirectCamera2Failure,
+    isGenerationSynchronouslyInvalidated: (Long) -> Boolean,
+    onPortTerminated: (Long, Throwable) -> Boolean,
+    latchFallback: (DirectCamera2Failure) -> Unit,
+    notifyUi: (DirectCamera2Failure) -> Unit
+) {
+    fun notifyLifecycleFailure() {
+        notifyUi(
+            DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.LIFECYCLE_OR_SUPERSESSION,
+                cause = failure.cause
+            )
+        )
+    }
+
+    if (isGenerationSynchronouslyInvalidated(generation)) {
+        notifyLifecycleFailure()
+        return
+    }
+    if (!onPortTerminated(generation, failure.cause)) {
+        notifyLifecycleFailure()
+        return
+    }
+    if (failure.kind.isEligibleForFallback) {
+        latchFallback(failure)
+    }
+    notifyUi(failure)
+}
 
 /**
  * Configuration-retained owner of the selected preview route and complete
@@ -34,9 +84,14 @@ class CameraCaptureRuntime @Inject internal constructor(
             Log.e(TAG, message, error)
         }
     )
+    private val retainedCameraXFallbackLatch = RetainedCameraXFallbackLatch()
 
     /** Whether the current attachment has a successfully bound preview. */
     val isPreviewReady: StateFlow<Boolean> = core.previewReady
+
+    /** Whether CameraX fallback is mandatory for this retained Activity lifetime. */
+    val isCameraXFallbackMandatory: StateFlow<Boolean> =
+        retainedCameraXFallbackLatch.mandatory
 
     internal val directPreviewConfiguration: StateFlow<DirectPreviewConfiguration?> =
         directCamera2PreviewController.previewConfiguration
@@ -62,7 +117,8 @@ class CameraCaptureRuntime @Inject internal constructor(
         surfaceTexture: SurfaceTexture,
         width: Int,
         height: Int,
-        onTerminalError: (Throwable) -> Unit = {}
+        onGenerationReserved: (Long) -> Unit = {},
+        onTerminalError: (DirectCamera2Failure) -> Unit = {}
     ): Long? {
         return when (val outcome = core.attach(
             route = CameraOwnershipRoute.PERSISTENT_CAMERA2,
@@ -73,12 +129,20 @@ class CameraCaptureRuntime @Inject internal constructor(
                     surfaceTexture = surfaceTexture,
                     width = width,
                     height = height,
-                    onTerminal = { error ->
-                        core.onPortTerminated(generation, error)
-                        onTerminalError(error)
+                    onTerminal = { failure ->
+                        handleDirectTerminalFailure(
+                            generation = generation,
+                            failure = failure,
+                            isGenerationSynchronouslyInvalidated =
+                                core::isGenerationSynchronouslyInvalidated,
+                            onPortTerminated = core::onPortTerminated,
+                            latchFallback = retainedCameraXFallbackLatch::latchIfEligible,
+                            notifyUi = onTerminalError
+                        )
                     }
                 )
-            }
+            },
+            onGenerationReserved = onGenerationReserved
         )) {
             is PreviewAttachOutcome.Ready -> outcome.generation
             PreviewAttachOutcome.Superseded -> null

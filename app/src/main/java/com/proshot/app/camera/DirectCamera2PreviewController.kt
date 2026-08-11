@@ -34,7 +34,7 @@ internal data class DirectPreviewAttachment(
     val surfaceTexture: SurfaceTexture,
     val width: Int,
     val height: Int,
-    val onTerminal: (Throwable) -> Unit
+    val onTerminal: (DirectCamera2Failure) -> Unit
 ) : PreviewAttachment
 
 internal data class DirectPreviewConfiguration(
@@ -53,6 +53,16 @@ internal fun selectRequiredBackCameraId(
     "Persistent Camera2 preview requires a physical back camera"
 )
 
+/** Classifies persistent-owner construction failures without message matching. */
+internal fun classifyPersistentOwnerConstructionFailure(
+    error: Exception
+): DirectCamera2FailureKind = when (error) {
+    is PersistentCamera2ConstructionBarrierException ->
+        DirectCamera2FailureKind.OWNER_TERMINAL_BARRIER
+    is SecurityException -> DirectCamera2FailureKind.PERMISSION_OR_SECURITY
+    else -> DirectCamera2FailureKind.UNSUPPORTED_CONFIGURATION
+}
+
 /** Tracks close identity under state lock and performs physical close after release. */
 internal fun <T> beginOwnerCloseOutsideStateLock(
     stateLock: ReentrantLock,
@@ -64,6 +74,70 @@ internal fun <T> beginOwnerCloseOutsideStateLock(
     if (shouldClose) closeOwner(owner)
 }
 
+/** Production action performing terminal callback before physical owner close outside state lock. */
+internal class DirectTerminalCloseAction<T>(
+    val owner: T,
+    val failure: DirectCamera2Failure,
+    val onTerminal: (DirectCamera2Failure) -> Unit,
+    val closeOwner: (T) -> Unit
+) {
+    fun execute() {
+        try {
+            onTerminal(failure)
+        } finally {
+            closeOwner(owner)
+        }
+    }
+}
+
+/** Runs terminal publication/close before callback-resource acknowledgement and completion. */
+internal fun executeTerminalFailureCallback(
+    publishTerminal: () -> Unit,
+    registerFailureResource: () -> Unit,
+    completeContinuation: () -> Unit
+) {
+    try {
+        publishTerminal()
+    } finally {
+        try {
+            registerFailureResource()
+        } finally {
+            completeContinuation()
+        }
+    }
+}
+
+/** Production seam preparing terminal publication under state lock for execution outside lock. */
+internal fun <O : Any, S : Any> prepareTerminalCloseAction(
+    lock: ReentrantLock,
+    closingOwners: MutableSet<O>,
+    owner: O,
+    currentIdentity: S?,
+    expectedIdentity: S,
+    failure: DirectCamera2Failure,
+    onTerminal: (DirectCamera2Failure) -> Unit,
+    closeOwner: (O) -> Unit,
+    clearState: () -> Unit
+): DirectTerminalCloseAction<O>? {
+    return lock.withLock {
+        if (currentIdentity === null ||
+            currentIdentity !== expectedIdentity ||
+            closingOwners.contains(owner)
+        ) {
+            null
+        } else {
+            closingOwners.add(owner)
+            clearState()
+            DirectTerminalCloseAction(
+                owner = owner,
+                failure = failure,
+                onTerminal = onTerminal,
+                closeOwner = closeOwner
+            )
+        }
+    }
+}
+
 private data class ActiveDirectOwner(
     val generation: Long,
     val surfaceTexture: SurfaceTexture,
@@ -71,7 +145,14 @@ private data class ActiveDirectOwner(
     val streamSize: Size,
     val characteristics: CameraCharacteristics,
     val previewAutoFocusMode: Int?,
-    val onTerminal: (Throwable) -> Unit
+    val onTerminal: (DirectCamera2Failure) -> Unit
+)
+
+private data class DirectConfigTuple(
+    val manager: CameraManager,
+    val cameraId: String,
+    val characteristics: CameraCharacteristics,
+    val selectedSize: CaptureSize
 )
 
 /**
@@ -97,6 +178,9 @@ internal class DirectCamera2PreviewController @Inject constructor(
 
     val isAttached: Boolean
         get() = lock.withLock { activeOwner != null }
+
+    internal val hasClosingOwners: Boolean
+        get() = lock.withLock { closingOwners.isNotEmpty() }
 
     override fun invalidate(generation: Long) {
         val ownerToClose = lock.withLock {
@@ -145,7 +229,18 @@ internal class DirectCamera2PreviewController @Inject constructor(
                 activeOwner.also { activeOwner = null }
             }
             previousOwner?.let { record -> beginOwnerClose(record.owner) }
-            awaitClosingOwners()
+
+            try {
+                awaitClosingOwners()
+            } catch (barrierError: Exception) {
+                if (barrierError is CancellationException) throw barrierError
+                val failure = DirectCamera2Failure(
+                    kind = DirectCamera2FailureKind.OWNER_TERMINAL_BARRIER,
+                    cause = barrierError
+                )
+                throw DirectCamera2RouteException(failure)
+            }
+
             currentCoroutineContext().ensureActive()
             val requestIsCurrent = lock.withLock {
                 requestedGeneration == generation &&
@@ -155,50 +250,71 @@ internal class DirectCamera2PreviewController @Inject constructor(
                 throw CancellationException("Direct preview attachment was superseded")
             }
 
-            val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
-                ?: throw IllegalStateException("CameraManager is not available")
-            val cameraId = resolvePrimaryCameraId(manager)
-            val characteristics = manager.getCameraCharacteristics(cameraId)
-            val streamMap = characteristics.get(
-                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
-            ) ?: throw IllegalStateException("Stream configuration map unavailable")
+            val config = try {
+                val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                    ?: throw IllegalStateException("CameraManager is not available")
+                val cameraId = resolvePrimaryCameraId(manager)
+                val characteristics = manager.getCameraCharacteristics(cameraId)
+                val streamMap = characteristics.get(
+                    CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+                ) ?: throw IllegalStateException("Stream configuration map unavailable")
 
-            val previewSizes = streamMap.getOutputSizes(SurfaceTexture::class.java)
-                ?.map { CaptureSize(it.width, it.height) }
-                .orEmpty()
-            val yuvSizes = streamMap.getOutputSizes(ImageFormat.YUV_420_888)
-                ?.map { CaptureSize(it.width, it.height) }
-                .orEmpty()
-            val selectedSize = Camera2StreamPairSelector.selectCommonStreamSize(
-                previewSizes = previewSizes,
-                yuvSizes = yuvSizes
-            )
-            val targetSize = Size(selectedSize.width, selectedSize.height)
-            val sensorOrientation = characteristics.get(
+                val previewSizes = streamMap.getOutputSizes(SurfaceTexture::class.java)
+                    ?.map { CaptureSize(it.width, it.height) }
+                    .orEmpty()
+                val yuvSizes = streamMap.getOutputSizes(ImageFormat.YUV_420_888)
+                    ?.map { CaptureSize(it.width, it.height) }
+                    .orEmpty()
+                val selectedSize = Camera2StreamPairSelector.selectCommonStreamSize(
+                    previewSizes = previewSizes,
+                    yuvSizes = yuvSizes
+                )
+                DirectConfigTuple(manager, cameraId, characteristics, selectedSize)
+            } catch (configError: Exception) {
+                if (configError is CancellationException) throw configError
+                val kind = when (configError) {
+                    is SecurityException -> DirectCamera2FailureKind.PERMISSION_OR_SECURITY
+                    is CameraAccessException -> DirectCamera2FailureKind.CAMERA_DEVICE_OR_OPEN
+                    else -> DirectCamera2FailureKind.UNSUPPORTED_CONFIGURATION
+                }
+                val failure = DirectCamera2Failure(kind = kind, cause = configError)
+                throw DirectCamera2RouteException(failure)
+            }
+
+            val targetSize = Size(config.selectedSize.width, config.selectedSize.height)
+            val sensorOrientation = config.characteristics.get(
                 CameraCharacteristics.SENSOR_ORIENTATION
             ) ?: 0
             val previewAfMode = SingleFrameCaptureController
                 .selectAutoFocusModeForStillCapture(
-                    availableModes = characteristics.get(
+                    availableModes = config.characteristics.get(
                         CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES
                     ),
                     source = FocusTargetSource.DEFAULT_CENTER
                 )
 
-            directAttachment.surfaceTexture.setDefaultBufferSize(
-                targetSize.width,
-                targetSize.height
-            )
-            val physicalOwner = resourceOwnerFactory.create(
-                directAttachment.surfaceTexture,
-                targetSize
-            )
+            val physicalOwner = try {
+                directAttachment.surfaceTexture.setDefaultBufferSize(
+                    targetSize.width,
+                    targetSize.height
+                )
+                resourceOwnerFactory.create(
+                    directAttachment.surfaceTexture,
+                    targetSize
+                )
+            } catch (createError: Exception) {
+                if (createError is CancellationException) throw createError
+                val kind = classifyPersistentOwnerConstructionFailure(createError)
+                val failure = DirectCamera2Failure(kind = kind, cause = createError)
+                throw DirectCamera2RouteException(failure)
+            }
+
             val record = ActiveDirectOwner(
                 generation = generation,
                 surfaceTexture = directAttachment.surfaceTexture,
                 owner = physicalOwner,
                 streamSize = targetSize,
-                characteristics = characteristics,
+                characteristics = config.characteristics,
                 previewAutoFocusMode = previewAfMode,
                 onTerminal = directAttachment.onTerminal
             )
@@ -222,8 +338,8 @@ internal class DirectCamera2PreviewController @Inject constructor(
             try {
                 physicalOwner.markOpenRequested()
                 val cameraDevice = awaitCameraOpen(
-                    manager = manager,
-                    cameraId = cameraId,
+                    manager = config.manager,
+                    cameraId = config.cameraId,
                     record = record
                 )
 
@@ -235,13 +351,25 @@ internal class DirectCamera2PreviewController @Inject constructor(
                     readerSurface = readerSurface,
                     record = record
                 )
-                startPreviewRepeating(cameraDevice, session, record)
+                try {
+                    startPreviewRepeating(cameraDevice, session, record)
+                } catch (repeatError: Exception) {
+                    if (repeatError is CancellationException) throw repeatError
+                    val kind = if (repeatError is SecurityException) {
+                        DirectCamera2FailureKind.PERMISSION_OR_SECURITY
+                    } else {
+                        DirectCamera2FailureKind.CAMERA_SESSION
+                    }
+                    val failure = DirectCamera2Failure(kind = kind, cause = repeatError)
+                    terminateRecord(record, failure)
+                    throw DirectCamera2RouteException(failure)
+                }
 
                 val becameReady = lock.withLock {
                     if (activeOwner === record && requestedGeneration == generation) {
                         mutablePreviewConfiguration.value = DirectPreviewConfiguration(
                             generation = generation,
-                            streamSize = selectedSize,
+                            streamSize = config.selectedSize,
                             sensorOrientationDegrees = sensorOrientation
                         )
                         true
@@ -254,7 +382,9 @@ internal class DirectCamera2PreviewController @Inject constructor(
                     throw CancellationException("Direct preview became stale before readiness")
                 }
             } catch (error: Throwable) {
-                closeRecord(record, notifyTerminal = false)
+                if (error !is DirectCamera2RouteException) {
+                    closeRecord(record, notifyTerminal = false)
+                }
                 throw error
             }
         }
@@ -310,8 +440,14 @@ internal class DirectCamera2PreviewController @Inject constructor(
             )
         } catch (error: Throwable) {
             captureFailure = error
-            if (isTerminalCaptureFailure(error)) {
-                terminateRecord(record, error)
+            if (error is Exception && isTerminalCaptureFailure(error)) {
+                val kind = if (error is SecurityException) {
+                    DirectCamera2FailureKind.PERMISSION_OR_SECURITY
+                } else {
+                    DirectCamera2FailureKind.TERMINAL_CAPTURE_OR_REPEATING
+                }
+                val failure = DirectCamera2Failure(kind = kind, cause = error)
+                terminateRecord(record, failure)
             }
             throw error
         } finally {
@@ -321,8 +457,22 @@ internal class DirectCamera2PreviewController @Inject constructor(
             ) {
                 try {
                     startPreviewRepeating(device, session, record)
-                } catch (restoreFailure: Throwable) {
-                    terminateRecord(record, restoreFailure)
+                } catch (restoreError: Exception) {
+                    if (restoreError !is CancellationException) {
+                        val restoreKind = if (restoreError is SecurityException) {
+                            DirectCamera2FailureKind.PERMISSION_OR_SECURITY
+                        } else {
+                            DirectCamera2FailureKind.TERMINAL_CAPTURE_OR_REPEATING
+                        }
+                        val failure = DirectCamera2Failure(
+                            kind = restoreKind,
+                            cause = restoreError
+                        )
+                        terminateRecord(record, failure)
+                        if (captureFailure == null) {
+                            throw restoreError
+                        }
+                    }
                 }
             }
         }
@@ -378,20 +528,48 @@ internal class DirectCamera2PreviewController @Inject constructor(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    record.owner.registerOpenFailure(camera)
-                    val error = IllegalStateException("Camera device was disconnected")
-                    terminateRecord(record, error)
-                    if (continuation.isActive) continuation.resumeWithException(error)
+                    val cause = IllegalStateException("Camera device was disconnected")
+                    val failure = DirectCamera2Failure(
+                        kind = DirectCamera2FailureKind.CAMERA_DEVICE_OR_OPEN,
+                        cause = cause
+                    )
+                    executeTerminalFailureCallback(
+                        publishTerminal = { terminateRecord(record, failure) },
+                        registerFailureResource = {
+                            record.owner.registerOpenFailure(camera)
+                        },
+                        completeContinuation = {
+                            if (continuation.isActive) {
+                                continuation.resumeWithException(
+                                    DirectCamera2RouteException(failure)
+                                )
+                            }
+                        }
+                    )
                 }
 
                 override fun onError(camera: CameraDevice, errorCode: Int) {
-                    record.owner.registerOpenFailure(camera)
-                    val error = CameraAccessException(
+                    val cause = CameraAccessException(
                         CameraAccessException.CAMERA_ERROR,
                         "Camera device error: $errorCode"
                     )
-                    terminateRecord(record, error)
-                    if (continuation.isActive) continuation.resumeWithException(error)
+                    val failure = DirectCamera2Failure(
+                        kind = DirectCamera2FailureKind.CAMERA_DEVICE_OR_OPEN,
+                        cause = cause
+                    )
+                    executeTerminalFailureCallback(
+                        publishTerminal = { terminateRecord(record, failure) },
+                        registerFailureResource = {
+                            record.owner.registerOpenFailure(camera)
+                        },
+                        completeContinuation = {
+                            if (continuation.isActive) {
+                                continuation.resumeWithException(
+                                    DirectCamera2RouteException(failure)
+                                )
+                            }
+                        }
+                    )
                 }
 
                 override fun onClosed(camera: CameraDevice) {
@@ -400,7 +578,24 @@ internal class DirectCamera2PreviewController @Inject constructor(
             }, record.owner.handler)
         } catch (error: SecurityException) {
             record.owner.markOpenSubmissionFailed()
-            if (continuation.isActive) continuation.resumeWithException(error)
+            val failure = DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.PERMISSION_OR_SECURITY,
+                cause = error
+            )
+            terminateRecord(record, failure)
+            if (continuation.isActive) {
+                continuation.resumeWithException(DirectCamera2RouteException(failure))
+            }
+        } catch (error: Exception) {
+            record.owner.markOpenSubmissionFailed()
+            val failure = DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.CAMERA_DEVICE_OR_OPEN,
+                cause = error
+            )
+            terminateRecord(record, failure)
+            if (continuation.isActive) {
+                continuation.resumeWithException(DirectCamera2RouteException(failure))
+            }
         } catch (error: Throwable) {
             record.owner.markOpenSubmissionFailed()
             if (continuation.isActive) continuation.resumeWithException(error)
@@ -432,10 +627,24 @@ internal class DirectCamera2PreviewController @Inject constructor(
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        record.owner.registerSessionFailure(session)
-                        val error = IllegalStateException("Camera session configuration failed")
-                        terminateRecord(record, error)
-                        if (continuation.isActive) continuation.resumeWithException(error)
+                        val cause = IllegalStateException("Camera session configuration failed")
+                        val failure = DirectCamera2Failure(
+                            kind = DirectCamera2FailureKind.CAMERA_SESSION,
+                            cause = cause
+                        )
+                        executeTerminalFailureCallback(
+                            publishTerminal = { terminateRecord(record, failure) },
+                            registerFailureResource = {
+                                record.owner.registerSessionFailure(session)
+                            },
+                            completeContinuation = {
+                                if (continuation.isActive) {
+                                    continuation.resumeWithException(
+                                        DirectCamera2RouteException(failure)
+                                    )
+                                }
+                            }
+                        )
                     }
 
                     override fun onActive(session: CameraCaptureSession) {
@@ -448,6 +657,26 @@ internal class DirectCamera2PreviewController @Inject constructor(
                 },
                 handler = record.owner.handler
             )
+        } catch (error: SecurityException) {
+            record.owner.markSessionSubmissionFailed()
+            val failure = DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.PERMISSION_OR_SECURITY,
+                cause = error
+            )
+            terminateRecord(record, failure)
+            if (continuation.isActive) {
+                continuation.resumeWithException(DirectCamera2RouteException(failure))
+            }
+        } catch (error: Exception) {
+            record.owner.markSessionSubmissionFailed()
+            val failure = DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.CAMERA_SESSION,
+                cause = error
+            )
+            terminateRecord(record, failure)
+            if (continuation.isActive) {
+                continuation.resumeWithException(DirectCamera2RouteException(failure))
+            }
         } catch (error: Throwable) {
             record.owner.markSessionSubmissionFailed()
             if (continuation.isActive) continuation.resumeWithException(error)
@@ -491,23 +720,36 @@ internal class DirectCamera2PreviewController @Inject constructor(
             }
         }
         beginOwnerClose(record.owner)
-        callback?.invoke(IllegalStateException("Direct Camera2 owner closed"))
+        callback?.invoke(
+            DirectCamera2Failure(
+                kind = DirectCamera2FailureKind.LIFECYCLE_OR_SUPERSESSION,
+                cause = IllegalStateException("Direct Camera2 owner closed")
+            )
+        )
     }
 
-    private fun terminateRecord(record: ActiveDirectOwner, error: Throwable) {
-        val callback = lock.withLock {
-            if (activeOwner !== record) {
-                null
-            } else {
+    private fun terminateRecord(
+        record: ActiveDirectOwner,
+        failure: DirectCamera2Failure
+    ): DirectTerminalCloseAction<PersistentCamera2ResourceOwner>? {
+        val action = prepareTerminalCloseAction(
+            lock = lock,
+            closingOwners = closingOwners,
+            owner = record.owner,
+            currentIdentity = activeOwner,
+            expectedIdentity = record,
+            failure = failure,
+            onTerminal = record.onTerminal,
+            closeOwner = PersistentCamera2ResourceOwner::close,
+            clearState = {
                 activeOwner = null
                 requestedGeneration = null
                 requestedSurfaceTexture = null
                 mutablePreviewConfiguration.value = null
-                record.onTerminal
             }
-        }
-        beginOwnerClose(record.owner)
-        callback?.invoke(error)
+        )
+        action?.execute()
+        return action
     }
 
     private fun isTerminalCaptureFailure(error: Throwable): Boolean {
