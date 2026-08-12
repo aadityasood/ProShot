@@ -383,6 +383,15 @@ class ReviewPackageTest {
     }
 
     @Test
+    fun responseSchemaV2AndDefectSidesAreCanonicalAndBound() {
+        assertEquals("2", ResponseSchema.VERSION)
+        assertEquals(listOf("LEFT", "RIGHT", "BOTH"), ResponseSchema.DEFECT_SIDES)
+        assertEquals(3, ResponseSchema.DEFECT_SIDES.toSet().size)
+        assertTrue(ResponseSchema.canonicalText().startsWith("RESPONSE_SCHEMA_V2\n"))
+        assertTrue(ResponseSchema.canonicalText().contains("DEFECT_SIDES=BOTH,LEFT,RIGHT\n"))
+    }
+
+    @Test
     fun htmlIsSelfContainedCspAndIdentitySafe() {
         val root = temp.resolve("html-root")
         TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons(), withCrops = true)
@@ -407,6 +416,12 @@ class ReviewPackageTest {
         // The exact response schema columns appear in the export code in order.
         val schemaArray = ResponseSchema.COLUMNS.joinToString(",")
         assertTrue(js.contains("SCHEMA = [" + ResponseSchema.COLUMNS.joinToString(",") { "\"$it\"" } + "]"))
+
+        // The defect sides array is serialized from ResponseSchema.DEFECT_SIDES and populates the selector.
+        val defectSidesArray = ResponseSchema.DEFECT_SIDES.joinToString(",") { "\"$it\"" }
+        assertTrue(js.contains("DEFECT_SIDES = [$defectSidesArray];"))
+        assertTrue(js.contains("DEFECT_SIDES.forEach(function (side)"))
+        assertFalse(js.contains("[\"LEFT\", \"RIGHT\"].forEach(function (side)"))
 
         // No arm names, trial ids, or source filenames in the page.
         val trials = DatasetModel.load(root).trials
