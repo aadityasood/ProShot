@@ -4,6 +4,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.charset.StandardCharsets
@@ -516,5 +517,153 @@ class ReviewAnalysisTest {
         val sealC = temp.resolve("dupes-c.properties")
         assertEquals(0, runCli(arrayOf("seal-review", "--package", "$pkg", "--responses", "$responses", "--out", "$sealC", "--reviewer", "other-r", "--category", "c", "--conflict", "NONE", "--utc-timestamp", "2026-08-01T00:00:00Z")))
         assertNotEquals(0, analyze(pkg, keyPath, root, temp.resolve("dupes-out3"), listOf(sealA, sealC)))
+    }
+
+    @Test
+    fun sealReviewAcceptsBothDefectSideWithTiePreference() {
+        val fix = sealedCalibration()
+        val manifest = StrictProperties.read(fix.pkg.resolve("manifest.properties"))
+        val packageId = manifest.require("package_id")
+        val pairs = manifest.require("pair.order").split(',')
+
+        val validBothRows = pairs.mapIndexed { index, p ->
+            if (index == 0) {
+                listOf(packageId, p, "TIE", "", "SEVERE_SUBJECT_CLIPPING", "BOTH", "")
+            } else {
+                listOf(packageId, p, "TIE", "", "", "", "")
+            }
+        }
+        val res = temp.resolve("both-valid-res.csv")
+        rawResponses(fix.pkg, ResponseSchema.COLUMNS, validBothRows, res)
+        val seal = temp.resolve("both-valid-seal.properties")
+        assertEquals(
+            0,
+            runCli(
+                arrayOf(
+                    "seal-review", "--package", "${fix.pkg}", "--responses", "$res", "--out", "$seal",
+                    "--reviewer", "r_both", "--category", "internal", "--conflict", "NONE",
+                ),
+            ),
+        )
+        assertTrue(Files.isRegularFile(seal))
+    }
+
+    @Test
+    fun sealReviewRejectsUndeclaredDefectSide() {
+        val fix = sealedCalibration()
+        val manifest = StrictProperties.read(fix.pkg.resolve("manifest.properties"))
+        val packageId = manifest.require("package_id")
+        val pairs = manifest.require("pair.order").split(',')
+
+        val undeclaredSides = listOf("MID", "BOTH_SIDES", "left", "LEFT_RIGHT", "BOTH ")
+        for ((idx, badSide) in undeclaredSides.withIndex()) {
+            val rows = pairs.mapIndexed { i, p ->
+                if (i == 0) {
+                    listOf(packageId, p, "LEFT", "", "SEVERE_SUBJECT_CLIPPING", badSide, "")
+                } else {
+                    listOf(packageId, p, "LEFT", "", "", "", "")
+                }
+            }
+            val res = temp.resolve("bad-side-$idx.csv")
+            rawResponses(fix.pkg, ResponseSchema.COLUMNS, rows, res)
+            val seal = temp.resolve("bad-side-$idx.seal")
+            val error = assertThrows(ToolError::class.java) {
+                ReviewAnalysis.runSealReview(
+                    packageDir = fix.pkg,
+                    responsesPath = res,
+                    outPath = seal,
+                    reviewer = "r9",
+                    category = "internal",
+                    conflict = "NONE",
+                    timestamp = null,
+                )
+            }
+            assertEquals(Codes.SEAL_RESPONSE_DEFECT, error.code)
+        }
+    }
+
+    @Test
+    fun simulatedV1ManifestFailsClosedUnderV2Validator() {
+        val root = temp.resolve("v1-sim-root")
+        TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val pkg = temp.resolve("v1-sim-pkg")
+        val key = temp.resolve("v1-sim-key")
+        assertEquals(0, runCli(arrayOf("blind", "--root", "$root", "--out-dir", "$pkg", "--key", "$key", "--seed", "8888888888888888888888888888888888888888888888888888888888888888")))
+
+        val manifestPath = pkg.resolve("manifest.properties")
+        val originalManifest = StrictProperties.read(manifestPath)
+        val tamperedEntries = originalManifest.entries.toMutableMap()
+        tamperedEntries["response_schema_version"] = "1"
+        Files.write(manifestPath, StrictProperties.serialize(tamperedEntries).toByteArray(StandardCharsets.UTF_8))
+
+        val error = assertThrows(ToolError::class.java) {
+            PackageValidator.readAndVerifyManifest(pkg)
+        }
+        assertEquals(Codes.SCHEMA_MISMATCH, error.code)
+    }
+
+    @Test
+    fun trialCriticalDefectAggregationBothSideMapsBothTrialsOnce() {
+        val mapping = mapOf(
+            "p01" to ReviewAnalysis.PairInfo("CMP_CB", ComparisonPurpose.CANDIDATE_VS_BASELINE, "city", "sun", 1, "T_LEFT", "candidate", "T_RIGHT", "baseline"),
+            "p02" to ReviewAnalysis.PairInfo("CMP_CS", ComparisonPurpose.CANDIDATE_VS_STOCK, "city", "sun", 1, "T_LEFT", "candidate", "T_STOCK", "stock"),
+        )
+        val r1Both = mapOf(
+            "p01" to ReviewAnalysis.ResponseRow("pkg", "p01", "TIE", emptyList(), "SEVERE_SUBJECT_CLIPPING", "BOTH", ""),
+            "p02" to ReviewAnalysis.ResponseRow("pkg", "p02", "TIE", emptyList(), "", "", ""),
+        )
+        val votes = ReviewAnalysis.aggregateTrialDefects(mapping, listOf("r1" to r1Both))
+
+        val leftVote = votes.getValue("T_LEFT")
+        val rightVote = votes.getValue("T_RIGHT")
+        val stockVote = votes.getValue("T_STOCK")
+
+        // BOTH flags both T_LEFT and T_RIGHT for r1 exactly once.
+        assertEquals(listOf("r1"), leftVote.flagged)
+        assertEquals(emptyList<String>(), leftVote.unflagged)
+        assertEquals(ReviewAnalysis.TrialCriticalStatus.CRITICAL, ReviewAnalysis.trialCriticalStatus(leftVote))
+
+        assertEquals(listOf("r1"), rightVote.flagged)
+        assertEquals(emptyList<String>(), rightVote.unflagged)
+        assertEquals(ReviewAnalysis.TrialCriticalStatus.CRITICAL, ReviewAnalysis.trialCriticalStatus(rightVote))
+
+        // T_STOCK was seen in p02 without a defect tag, so r1 is unflagged.
+        assertEquals(emptyList<String>(), stockVote.flagged)
+        assertEquals(listOf("r1"), stockVote.unflagged)
+        assertEquals(ReviewAnalysis.TrialCriticalStatus.NONCRITICAL, ReviewAnalysis.trialCriticalStatus(stockVote))
+    }
+
+    @Test
+    fun calibrationAnalyzeWithBothDefectSideReportsCriticalInBothArms() {
+        val root = temp.resolve("cal-both-root")
+        TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val pkg = temp.resolve("cal-both-pkg")
+        val key = temp.resolve("cal-both-key")
+        assertEquals(0, runCli(arrayOf("blind", "--root", "$root", "--out-dir", "$pkg", "--key", "$key", "--seed", "8888888888888888888888888888888888888888888888888888888888888888")))
+
+        val manifest = StrictProperties.read(pkg.resolve("manifest.properties"))
+        val packageId = manifest.require("package_id")
+        val pairs = manifest.require("pair.order").split(',')
+
+        // First pair specifies BOTH defect side.
+        val rows = pairs.mapIndexed { index, p ->
+            if (index == 0) {
+                listOf(packageId, p, "TIE", "", "SEVERE_SUBJECT_CLIPPING", "BOTH", "")
+            } else {
+                listOf(packageId, p, "TIE", "", "", "", "")
+            }
+        }
+        val res = temp.resolve("cal-both-res.csv")
+        Csv.write(res, ResponseSchema.COLUMNS, rows)
+        val seal = temp.resolve("cal-both-seal.properties")
+        assertEquals(0, runCli(arrayOf("seal-review", "--package", "$pkg", "--responses", "$res", "--out", "$seal", "--reviewer", "both-r", "--category", "c", "--conflict", "NONE", "--utc-timestamp", "2026-08-02T00:00:00Z")))
+
+        val outDir = temp.resolve("cal-both-report")
+        assertEquals(0, analyze(pkg, key, root, outDir, listOf(seal)))
+        val csv = Files.readString(outDir.resolve("analysis-report.csv"))
+
+        assertTrue(csv, csv.contains("status,status,INCONCLUSIVE / CALIBRATION"))
+        assertTrue(csv, csv.contains("capture_by_arm,arm_baseline_pass_a.reviewer_critical,1"))
+        assertTrue(csv, csv.contains("capture_by_arm,arm_baseline_pass_b.reviewer_critical,1"))
     }
 }

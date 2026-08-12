@@ -236,6 +236,9 @@ WRONG_ORIENTATION, UNUSABLE_FOCUS_OR_MOMENT, SEVERE_SUBJECT_CLIPPING,
 SEVERE_GHOSTING_OR_MERGE_ARTIFACT, OTHER_PREDECLARED
 ```
 
+`critical_defect_side` accepts `LEFT`, `RIGHT`, or `BOTH`. Choose `BOTH` when a
+critical defect affects both images.
+
 `FAILED_SAVE` is a capture outcome, not a reviewer-visible defect tag, and
 `OTHER_PREDECLARED` requires a nonblank reviewer note.
 
@@ -332,14 +335,16 @@ identified from the validated plan and reported.
 For each arm, excluded trials are reported separately and excluded from the
 completion and critical-failure denominators. `FAILED` capture outcomes are
 automatically critical failures; `SUCCESS` trials can acquire a
-reviewer-declared critical defect. `critical_defect_side` is mapped through the
-private key to the affected trial, and each unique reviewer contributes one
-trial-level boolean (flagged when any of their responses marks that trial with
-a critical defect). One reviewer's vote decides; otherwise a strict majority
-decides, and equal votes leave the trial's evidence `DISPUTED`. Repeated
-comparisons and crops never increase the independent trial count. A disputed
-binding candidate or baseline trial makes the critical-failure gate
-`INCONCLUSIVE` unless another fail-closed condition already causes `FAIL`.
+reviewer-declared critical defect. The selected side is mapped through the
+private key to the affected trial. Choosing `BOTH` flags both underlying trials
+once for that reviewer. This is separate from the reviewer’s `LEFT`, `RIGHT`,
+or `TIE` preference. Each unique reviewer contributes one trial-level boolean
+(flagged when any of their responses marks that trial with a critical defect).
+One reviewer's vote decides; otherwise a strict majority decides, and equal
+votes leave the trial's evidence `DISPUTED`. Repeated comparisons and crops
+never increase the independent trial count. A disputed binding candidate or
+baseline trial makes the critical-failure gate `INCONCLUSIVE` unless another
+fail-closed condition already causes `FAIL`.
 
 ### Non-inferiority semantics
 

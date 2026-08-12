@@ -738,8 +738,8 @@ internal object ReviewAnalysis {
             if (rowObj.defect.isNotEmpty() && rowObj.defect !in ResponseSchema.DEFECT_TAGS) {
                 throw ToolError(Codes.SEAL_RESPONSE_DEFECT, "unknown critical-defect tag '${rowObj.defect}' for pair ${rowObj.pairId}")
             }
-            if (rowObj.defectSide.isNotEmpty() && rowObj.defectSide !in setOf("LEFT", "RIGHT")) {
-                throw ToolError(Codes.SEAL_RESPONSE_DEFECT, "critical-defect side must be LEFT or RIGHT for pair ${rowObj.pairId}")
+            if (rowObj.defectSide.isNotEmpty() && rowObj.defectSide !in ResponseSchema.DEFECT_SIDES) {
+                throw ToolError(Codes.SEAL_RESPONSE_DEFECT, "critical-defect side must be LEFT, RIGHT, or BOTH for pair ${rowObj.pairId}")
             }
             if (rowObj.defect.isEmpty() != rowObj.defectSide.isEmpty()) {
                 throw ToolError(Codes.SEAL_RESPONSE_DEFECT, "critical-defect tag and side must be set together for pair ${rowObj.pairId}")
@@ -885,9 +885,15 @@ internal object ReviewAnalysis {
                 val info = pairMapping[pairId] ?: continue
                 seen += info.leftTrialId
                 seen += info.rightTrialId
-                if (row.defect.isNotEmpty() && row.defectSide in setOf("LEFT", "RIGHT")) {
-                    val flaggedTrialId = if (row.defectSide == "LEFT") info.leftTrialId else info.rightTrialId
-                    flagged += flaggedTrialId
+                if (row.defect.isNotEmpty() && row.defectSide in ResponseSchema.DEFECT_SIDES) {
+                    when (row.defectSide) {
+                        "LEFT" -> flagged += info.leftTrialId
+                        "RIGHT" -> flagged += info.rightTrialId
+                        "BOTH" -> {
+                            flagged += info.leftTrialId
+                            flagged += info.rightTrialId
+                        }
+                    }
                 }
             }
         }

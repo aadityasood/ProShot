@@ -543,11 +543,12 @@ internal object ReviewSource {
  * defect tag. `OTHER_PREDECLARED` requires a nonblank reviewer note.
  */
 internal object ResponseSchema {
-    const val VERSION = "1"
+    const val VERSION = "2"
     val COLUMNS: List<String> = listOf(
         "package_id", "pair_id", "choice", "reason_tags", "critical_defect", "critical_defect_side", "note",
     )
     val CHOICES: Set<String> = setOf("LEFT", "RIGHT", "TIE")
+    val DEFECT_SIDES: List<String> = listOf("LEFT", "RIGHT", "BOTH")
     val REASON_TAGS: List<String> = listOf(
         "MOMENT_FOCUS", "EXPOSURE_HIGHLIGHTS", "COLOR_WB", "SKIN_RENDERING",
         "TEXTURE_NOISE", "NATURALNESS", "VISIBLE_ARTIFACT",
@@ -561,6 +562,7 @@ internal object ResponseSchema {
         append("RESPONSE_SCHEMA_V").append(VERSION).append('\n')
         append("COLUMNS=").append(COLUMNS.joinToString(",")).append('\n')
         append("CHOICES=").append(CHOICES.sorted().joinToString(",")).append('\n')
+        append("DEFECT_SIDES=").append(DEFECT_SIDES.sorted().joinToString(",")).append('\n')
         append("TAGS=").append(REASON_TAGS.sorted().joinToString(",")).append('\n')
         append("DEFECT_TAGS=").append(DEFECT_TAGS.sorted().joinToString(",")).append('\n')
     }
@@ -860,6 +862,7 @@ internal object ReviewPackage {
         val schemaJs = ResponseSchema.COLUMNS.joinToString(",") { "\"$it\"" }
         val tagsJs = ResponseSchema.REASON_TAGS.joinToString(",") { "\"$it\"" }
         val defectsJs = ResponseSchema.DEFECT_TAGS.joinToString(",") { "\"$it\"" }
+        val defectSidesJs = ResponseSchema.DEFECT_SIDES.joinToString(",") { "\"$it\"" }
 
         val html = """
 <!DOCTYPE html>
@@ -890,6 +893,7 @@ var PACKAGE_ID = "@@PACKAGE_ID@@";
 var SCHEMA = [@@SCHEMA@@];
 var REASON_TAGS = [@@REASON_TAGS@@];
 var DEFECT_TAGS = [@@DEFECT_TAGS@@];
+var DEFECT_SIDES = [@@DEFECT_SIDES@@];
 var PAIRS = [@@PAIRS@@];
 var state = {};
 PAIRS.forEach(function (pair) {
@@ -963,7 +967,7 @@ function rebuild() {
     controls.appendChild(el("span", { "class": "lbl" }, " Defect side: "));
     var sideSelect = el("select", { "id": "side_" + pair.id });
     sideSelect.appendChild(el("option", { "value": "" }, "(none)"));
-    ["LEFT", "RIGHT"].forEach(function (side) {
+    DEFECT_SIDES.forEach(function (side) {
       var opt = el("option", { "value": side }, side);
       if (s.side === side) { opt.setAttribute("selected", "selected"); }
       sideSelect.appendChild(opt);
@@ -1034,6 +1038,7 @@ img { max-width: 100%; border: 1px solid #ddd; }
                 .replace("@@SCHEMA@@", schemaJs)
                 .replace("@@REASON_TAGS@@", tagsJs)
                 .replace("@@DEFECT_TAGS@@", defectsJs)
+                .replace("@@DEFECT_SIDES@@", defectSidesJs)
                 .replace("@@PAIRS@@", pairsJs),
             css = css,
         )
