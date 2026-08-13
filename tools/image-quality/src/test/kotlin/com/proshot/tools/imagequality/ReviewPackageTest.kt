@@ -499,4 +499,120 @@ class ReviewPackageTest {
         val code = runCli(arrayOf("blind", "--root", "$root", "--out-dir", "$pkg", "--key", "${alias.resolve("inside.key")}", "--seed", "1010101010101010101010101010101010101010101010101010101010101010"))
         assertNotEquals(0, code)
     }
+
+    @Test
+    fun productionLabelMapKeysEqualCanonicalResponseSchemaSets() {
+        assertEquals(ResponseSchema.REASON_TAGS.toSet(), ReviewPageLabels.REASON_LABELS.keys)
+        assertEquals(ResponseSchema.DEFECT_TAGS.toSet(), ReviewPageLabels.DEFECT_LABELS.keys)
+        assertEquals(7, ReviewPageLabels.REASON_LABELS.size)
+        assertEquals(5, ReviewPageLabels.DEFECT_LABELS.size)
+    }
+
+    @Test
+    fun canonicalReasonAndDefectValuesArePairedWithExactVisibleLabels() {
+        val root = temp.resolve("labels-root")
+        TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons())
+        val pkg = temp.resolve("labels-pkg")
+        val key = temp.resolve("labels-key")
+        assertEquals(0, blind(root, pkg, key, "1111111111111111111111111111111111111111111111111111111111111111"))
+
+        val js = Files.readString(pkg.resolve("review.js"))
+        for ((canonical, label) in ReviewPageLabels.REASON_LABELS) {
+            assertTrue("JS must pair reason '$canonical' with label '$label'", js.contains("\"$canonical\":\"$label\""))
+        }
+
+        for ((canonical, label) in ReviewPageLabels.DEFECT_LABELS) {
+            assertTrue("JS must pair defect '$canonical' with label '$label'", js.contains("\"$canonical\":\"$label\""))
+        }
+    }
+
+    @Test
+    fun sourceOrderingEnforcesInvalidReturnGuardBeforeBlobCreation() {
+        val root = temp.resolve("order-root")
+        TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons())
+        val pkg = temp.resolve("order-pkg")
+        val key = temp.resolve("order-key")
+        assertEquals(0, blind(root, pkg, key, "1111111111111111111111111111111111111111111111111111111111111111"))
+
+        val js = Files.readString(pkg.resolve("review.js"))
+        val handlerStart = js.indexOf("document.getElementById(\"exportBtn\").addEventListener")
+        assertTrue("exportBtn listener must exist in JS", handlerStart >= 0)
+        val exportHandler = js.substring(handlerStart)
+
+        val blobMatches = "new Blob".toRegex().findAll(exportHandler).toList()
+        assertEquals("exportHandler must contain exactly one 'new Blob'", 1, blobMatches.size)
+
+        val guardIndex = exportHandler.indexOf("if (!result.valid)")
+        assertTrue("if (!result.valid) guard must exist in exportHandler", guardIndex >= 0)
+
+        val returnIndex = exportHandler.indexOf("return;", guardIndex)
+        assertTrue("return; must exist after if (!result.valid) guard", returnIndex > guardIndex)
+
+        val blobIndex = blobMatches[0].range.first
+        assertTrue("invalid branch return must occur before Blob creation", returnIndex < blobIndex)
+    }
+
+    @Test
+    fun generatedPageKeepsCsvAreaEmptyAndReturnsBeforeBlobWhileInvalid() {
+        val root = temp.resolve("invalid-csv-root")
+        TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons())
+        val pkg = temp.resolve("invalid-csv-pkg")
+        val key = temp.resolve("invalid-csv-key")
+        assertEquals(0, blind(root, pkg, key, "4444444444444444444444444444444444444444444444444444444444444444"))
+
+        val js = Files.readString(pkg.resolve("review.js"))
+        assertTrue("JS refresh must clear csvArea.value = \"\" when invalid", js.contains("csvArea.value = \"\";"))
+
+        val handlerStart = js.indexOf("document.getElementById(\"exportBtn\").addEventListener")
+        val exportHandler = js.substring(handlerStart)
+        val guardIndex = exportHandler.indexOf("if (!result.valid)")
+        val returnIndex = exportHandler.indexOf("return;", guardIndex)
+        val blobIndex = exportHandler.indexOf("new Blob")
+
+        assertTrue("Guard must exist", guardIndex >= 0)
+        assertTrue("Return must follow guard", returnIndex > guardIndex)
+        assertTrue("Return must precede Blob creation", returnIndex < blobIndex)
+    }
+
+    @Test
+    fun initialErrorsSuppressedUntilExportAttempt() {
+        val root = temp.resolve("suppress-root")
+        TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons())
+        val pkg = temp.resolve("suppress-pkg")
+        val key = temp.resolve("suppress-key")
+        assertEquals(0, blind(root, pkg, key, "2222222222222222222222222222222222222222222222222222222222222222"))
+
+        val js = Files.readString(pkg.resolve("review.js"))
+        assertTrue(js.contains("var hasAttemptedExport = false;"))
+        assertTrue(js.contains("hasAttemptedExport = true;"))
+        assertTrue(js.contains("if (hasAttemptedExport && result.errors.length > 0)"))
+    }
+
+    @Test
+    fun HTMLAndCSSPreserveAccessibilityAndResponsiveConstraintsWithoutOverflowHidden() {
+        val root = temp.resolve("a11y-root")
+        TestData.writeStandardDataset(root, DatasetKind.CANDIDATE, TestData.candidateComparisons())
+        val pkg = temp.resolve("a11y-pkg")
+        val key = temp.resolve("a11y-key")
+        assertEquals(0, blind(root, pkg, key, "3333333333333333333333333333333333333333333333333333333333333333"))
+
+        val html = Files.readString(pkg.resolve("review.html"))
+        val css = Files.readString(pkg.resolve("review.css"))
+
+        // Accessibility attributes
+        assertTrue(html.contains("aria-live=\"polite\""))
+        assertTrue(html.contains("role=\"region\""))
+        assertTrue(html.contains("tabindex=\"-1\""))
+
+        // CSS responsive sizing and media query
+        assertTrue(css.contains("display: inline-flex"))
+        assertTrue(css.contains("white-space: nowrap"))
+        assertTrue(css.contains("max-width: 100%"))
+        assertTrue(css.contains("@media (max-width:"))
+
+        // No overflow-x: hidden
+        assertFalse("CSS must not use overflow-x: hidden", css.contains("overflow-x: hidden"))
+
+        // Note: Real browser rendering remains manual smoke test evidence.
+    }
 }

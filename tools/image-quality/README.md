@@ -79,17 +79,17 @@ current UTC time.
 Private datasets live under the already Git-ignored `reference-captures/` root
 or outside the repository. A dataset directory contains:
 
-- `dataset.properties` — schema version (must be `1.0`), dataset version,
+- `dataset.properties`: schema version (must be `1.0`), dataset version,
   contract version, dataset kind (`CALIBRATION` or `CANDIDATE`), capture
   protocol, declared arms, required repetitions, app/baseline/candidate
   identifiers, privacy classification (`PRIVATE` or `CONTROLLED`), predeclared
   hypothesis, critical scenes, guardrails, and optional
   `allow_shared_originals=true` for a declared same-source use case.
-- `trials.csv` — one row per trial with the exact columns below.
-- `comparison-plan.csv` — `comparison_id, arm_a, arm_b, purpose` where purpose
+- `trials.csv`: one row per trial with the exact columns below.
+- `comparison-plan.csv`: `comparison_id, arm_a, arm_b, purpose` where purpose
   is `BLINDED_AA`, `CANDIDATE_VS_BASELINE`, `CANDIDATE_VS_STOCK`, or
   `CONTEXTUAL_REFERENCE`.
-- optional `crops.csv` — `trial_id, crop_id, crop_purpose, rect_x0, rect_y0,
+- optional `crops.csv`: `trial_id, crop_id, crop_purpose, rect_x0, rect_y0,
   rect_x1, rect_y1` with normalized `[0,1]` rectangles. Accepted crop purposes:
   `FOCUS`, `TEXTURE`, `FACE`, `HIGHLIGHT`, `SHADOW`, `ARTIFACT`, `GENERAL`.
 
@@ -187,7 +187,7 @@ substitute for escape detection.
   a fresh sRGB `BufferedImage`, writes whole-image and native-resolution crop
   PNGs with a fresh PNG writer and no inherited metadata, then validates the
   PNG chunk stream to accept only `IHDR`, one or more `IDAT`, and `IEND` in
-  valid order — any ancillary chunk (`tEXt`, `iTXt`, `zTXt`, `tIME`, EXIF, ICC,
+  valid order. Any ancillary chunk (`tEXt`, `iTXt`, `zTXt`, `tIME`, EXIF, ICC,
   or other) fails package creation. Indexed inputs are converted to true-color
   sRGB so `PLTE` is not required;
 - writes one self-contained, network-free HTML review page with a restrictive
@@ -211,36 +211,48 @@ replaces the original.
 
 ### Offline review page and responses
 
-The generated `review.html` uses only local `review.js` and `review.css` and
-local images. It collects exactly, per pair: `LEFT`/`RIGHT`/`TIE`, zero or more
-bounded reason tags, an optional critical-defect tag and side, and an optional
-note. It exports a UTF-8 `responses.csv` whose columns are produced from the
-same canonical response-schema declaration used by the JVM parser:
+The generated `review.html` uses only local `review.js`, `review.css`, and local
+images. It guides reviewers through five core evaluation principles:
+
+- **First decision:** For every pair, the reviewer must first choose which
+  photograph they would keep or use (`LEFT`, `RIGHT`, or `TIE`).
+- **Optional reason tags:** Reason tags represent broad analysis categories
+  (such as focus, exposure, or color). Multiple tags may be selected to explain a
+  preference, while detailed professional observations belong in the note.
+- **Rare critical defects:** Critical defect options are reserved for rare
+  cases where an image is genuinely unusable, not merely worse. `BOTH` is used
+  only when the same defect renders both images unusable.
+- **Export validation:** Export to `responses.csv` is blocked until every
+  pair has an explicit preference choice and any dependent critical fields
+  (such as selecting a defect side or providing an explanatory note for `OTHER_PREDECLARED`)
+  are complete.
+- **Canonical values:** The review page presents human-readable labels to the
+  reviewer, but the exported `responses.csv` stores canonical machine values.
+
+The exported UTF-8 `responses.csv` uses the standard column format:
 
 ```
 package_id, pair_id, choice, reason_tags, critical_defect,
 critical_defect_side, note
 ```
 
-The reason tags are exactly the accepted T18.0 review categories:
+The reason tags map to canonical categories:
 
 ```
 MOMENT_FOCUS, EXPOSURE_HIGHLIGHTS, COLOR_WB, SKIN_RENDERING,
 TEXTURE_NOISE, NATURALNESS, VISIBLE_ARTIFACT
 ```
 
-The critical-defect tags are exactly:
+The critical-defect tags map to canonical defect categories:
 
 ```
 WRONG_ORIENTATION, UNUSABLE_FOCUS_OR_MOMENT, SEVERE_SUBJECT_CLIPPING,
 SEVERE_GHOSTING_OR_MERGE_ARTIFACT, OTHER_PREDECLARED
 ```
 
-`critical_defect_side` accepts `LEFT`, `RIGHT`, or `BOTH`. Choose `BOTH` when a
-critical defect affects both images.
-
-`FAILED_SAVE` is a capture outcome, not a reviewer-visible defect tag, and
-`OTHER_PREDECLARED` requires a nonblank reviewer note.
+`critical_defect_side` accepts `LEFT`, `RIGHT`, or `BOTH`. `FAILED_SAVE` is a
+capture outcome, not a reviewer-visible defect tag, and `OTHER_PREDECLARED`
+requires a nonblank reviewer note.
 
 The schema's canonical text is hashed into the package manifest; `seal-review`
 rejects a package whose declared response-schema hash does not match the
@@ -278,7 +290,7 @@ counted twice).
   completeness and allowed values, rejects duplicate or unknown pair IDs,
   hashes the package manifest and the response file, records the reviewer
   category/conflict declaration and a UTC seal timestamp, and writes an
-  immutable-by-convention seal artifact — it never reads the private key.
+  immutable-by-convention seal artifact. It never reads the private key.
   Missing, reordered, renamed, duplicated, or additional response columns fail
   closed.
 - `analyze` accepts one or more seals plus the separate private key. It verifies
@@ -399,7 +411,7 @@ policy, approval identity/category, and UTC approval timestamp) and runs
 The locked artifact binds the calibration evidence; it is not expected to equal
 a later candidate dataset hash. Candidate analysis:
 
-- re-verifies every referenced calibration artifact and hash from the lock —
+- re-verifies every referenced calibration artifact and hash from the lock:
   unavailable or changed calibration evidence is rejected;
 - verifies the current contract/baseline identity;
 - requires the lock's critical-scene set to equal the candidate dataset's
