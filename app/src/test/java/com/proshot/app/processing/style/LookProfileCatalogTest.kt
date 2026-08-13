@@ -80,7 +80,7 @@ class LookProfileCatalogTest {
             toneCurve = listOf(
                 ToneCurvePoint(0.0f, 0.02f),
                 ToneCurvePoint(0.5f, 0.8f),
-                ToneCurvePoint(0.75f, 0.6f),  // output decreases — invalid
+                ToneCurvePoint(0.75f, 0.6f),  // output decreases: invalid
                 ToneCurvePoint(1.0f, 0.98f)
             ),
             globalWarmthShiftKelvin = 0,

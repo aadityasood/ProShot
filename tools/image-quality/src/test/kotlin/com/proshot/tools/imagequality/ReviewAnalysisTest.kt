@@ -666,4 +666,35 @@ class ReviewAnalysisTest {
         assertTrue(csv, csv.contains("capture_by_arm,arm_baseline_pass_a.reviewer_critical,1"))
         assertTrue(csv, csv.contains("capture_by_arm,arm_baseline_pass_b.reviewer_critical,1"))
     }
+
+    @Test
+    fun blankChoiceFailsWithSealResponseChoiceCode() {
+        val fix = sealedCalibration()
+        val manifest = StrictProperties.read(fix.pkg.resolve("manifest.properties"))
+        val packageId = manifest.require("package_id")
+        val pairs = manifest.require("pair.order").split(',')
+
+        val blankChoiceRows = pairs.mapIndexed { index, p ->
+            if (index == 0) {
+                listOf(packageId, p, "", "", "", "", "")
+            } else {
+                listOf(packageId, p, "TIE", "", "", "", "")
+            }
+        }
+        val res = temp.resolve("blank-choice-res.csv")
+        rawResponses(fix.pkg, ResponseSchema.COLUMNS, blankChoiceRows, res)
+        val seal = temp.resolve("blank-choice-seal.properties")
+        val error = assertThrows(ToolError::class.java) {
+            ReviewAnalysis.runSealReview(
+                packageDir = fix.pkg,
+                responsesPath = res,
+                outPath = seal,
+                reviewer = "r_blank",
+                category = "internal",
+                conflict = "NONE",
+                timestamp = null,
+            )
+        }
+        assertEquals(Codes.SEAL_RESPONSE_CHOICE, error.code)
+    }
 }

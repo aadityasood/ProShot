@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ProShot — Android Development Environment Setup Script
+# ProShot: Android Development Environment Setup Script
 # System: Fedora 43 (x86_64)
 #
 # This script installs everything needed to build ProShot:
@@ -58,7 +58,7 @@ print_error() {
 }
 
 # ==============================================================================
-print_header "ProShot — Android Environment Setup"
+print_header "ProShot: Android Environment Setup"
 echo ""
 echo -e "  This will install the Android development toolchain on your system."
 echo -e "  ${YELLOW}You will be prompted for sudo password for JDK 21 installation.${NC}"
@@ -66,7 +66,7 @@ echo ""
 read -p "  Press Enter to continue (Ctrl+C to cancel)... "
 
 # ==============================================================================
-print_header "Step 1/5 — Install JDK 21"
+print_header "Step 1/5: Install JDK 21"
 
 if [ -d "/usr/lib/jvm/java-21-openjdk" ]; then
     print_ok "JDK 21 already installed at /usr/lib/jvm/java-21-openjdk"
@@ -86,7 +86,7 @@ JDK21_VERSION=$(/usr/lib/jvm/java-21-openjdk/bin/java -version 2>&1 | head -1)
 print_ok "JDK 21: $JDK21_VERSION"
 
 # ==============================================================================
-print_header "Step 2/5 — Download Android Command-Line Tools"
+print_header "Step 2/5: Download Android Command-Line Tools"
 
 if [ -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
     print_ok "Android command-line tools already installed"
@@ -101,7 +101,7 @@ else
     print_step "Extracting..."
     unzip -q "$TEMP_DIR/cmdline-tools.zip" -d "$TEMP_DIR"
 
-    # The zip contains a 'cmdline-tools' folder — move it to 'latest'
+    # The zip contains a 'cmdline-tools' folder. Move it to 'latest'
     if [ -d "$TEMP_DIR/cmdline-tools" ]; then
         mv "$TEMP_DIR/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
         print_ok "Command-line tools installed to $SDK_ROOT/cmdline-tools/latest"
@@ -130,12 +130,12 @@ else
 fi
 
 # ==============================================================================
-print_header "Step 3/5 — Set Environment Variables"
+print_header "Step 3/5: Set Environment Variables"
 
 MARKER="# ===== Android Development Environment ====="
 
 if grep -q "$MARKER" "$HOME/.bashrc" 2>/dev/null; then
-    print_warn "Android environment variables already in ~/.bashrc — skipping"
+    print_warn "Android environment variables already in ~/.bashrc. Skipping"
 else
     print_step "Adding environment variables to ~/.bashrc..."
     cat >> "$HOME/.bashrc" << EOF
@@ -163,7 +163,7 @@ export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
 # ==============================================================================
-print_header "Step 4/5 — Install SDK Components"
+print_header "Step 4/5: Install SDK Components"
 
 print_step "Accepting licenses..."
 yes | sdkmanager --licenses > /dev/null 2>&1 || true
@@ -186,7 +186,7 @@ sdkmanager "cmake;$CMAKE_VERSION"
 print_ok "All SDK components installed"
 
 # ==============================================================================
-print_header "Step 5/5 — Verification"
+print_header "Step 5/5: Verification"
 
 echo ""
 PASS=0

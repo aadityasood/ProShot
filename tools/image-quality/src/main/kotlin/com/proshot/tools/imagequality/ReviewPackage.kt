@@ -570,6 +570,35 @@ internal object ResponseSchema {
     fun canonicalHash(): String = Hashes.sha256(canonicalText())
 }
 
+internal object ReviewPageLabels {
+    val REASON_LABELS: Map<String, String> = mapOf(
+        "MOMENT_FOCUS" to "Focus or captured moment",
+        "EXPOSURE_HIGHLIGHTS" to "Exposure or highlight detail",
+        "COLOR_WB" to "Color and white balance",
+        "SKIN_RENDERING" to "Skin rendering",
+        "TEXTURE_NOISE" to "Texture and noise",
+        "NATURALNESS" to "Natural appearance",
+        "VISIBLE_ARTIFACT" to "Visible artifact",
+    )
+
+    val DEFECT_LABELS: Map<String, String> = mapOf(
+        "WRONG_ORIENTATION" to "Wrong orientation",
+        "UNUSABLE_FOCUS_OR_MOMENT" to "Unusable focus or missed moment",
+        "SEVERE_SUBJECT_CLIPPING" to "Severe subject clipping",
+        "SEVERE_GHOSTING_OR_MERGE_ARTIFACT" to "Severe ghosting or merge artifact",
+        "OTHER_PREDECLARED" to "Other critical defect (explain in note)",
+    )
+
+    init {
+        require(REASON_LABELS.keys == ResponseSchema.REASON_TAGS.toSet()) {
+            "REASON_LABELS keys must equal ResponseSchema.REASON_TAGS set exactly"
+        }
+        require(DEFECT_LABELS.keys == ResponseSchema.DEFECT_TAGS.toSet()) {
+            "DEFECT_LABELS keys must equal ResponseSchema.DEFECT_TAGS set exactly"
+        }
+    }
+}
+
 /**
  * Deterministically resolves every comparison to exactly one pair per grain.
  *
@@ -863,6 +892,8 @@ internal object ReviewPackage {
         val tagsJs = ResponseSchema.REASON_TAGS.joinToString(",") { "\"$it\"" }
         val defectsJs = ResponseSchema.DEFECT_TAGS.joinToString(",") { "\"$it\"" }
         val defectSidesJs = ResponseSchema.DEFECT_SIDES.joinToString(",") { "\"$it\"" }
+        val reasonLabelsJs = ReviewPageLabels.REASON_LABELS.entries.joinToString(",") { "\"${it.key}\":\"${it.value}\"" }
+        val defectLabelsJs = ReviewPageLabels.DEFECT_LABELS.entries.joinToString(",") { "\"${it.key}\":\"${it.value}\"" }
 
         val html = """
 <!DOCTYPE html>
@@ -875,7 +906,9 @@ internal object ReviewPackage {
 </head>
 <body>
 <h1>Offline review</h1>
-<p class="notice">Compare the two photographs. This page is self-contained and offline. It never contacts a network.</p>
+<p class="notice">Compare the two photographs. First choose the photograph you would keep or use (Left, Right, or Tie). Reason tags are optional broad analysis categories, and technical detail belongs in the note. A critical defect is rare and means unusable. Choose Defect Side BOTH only when the same critical defect makes both images unusable.</p>
+<div id="progress" class="progress"></div>
+<div id="errorSummary" class="error-summary" tabindex="-1" role="region" aria-live="polite" aria-atomic="true"></div>
 <div id="pairs"></div>
 <div class="toolbar">
 <button type="button" id="exportBtn">Generate responses.csv</button>
@@ -895,22 +928,30 @@ var REASON_TAGS = [@@REASON_TAGS@@];
 var DEFECT_TAGS = [@@DEFECT_TAGS@@];
 var DEFECT_SIDES = [@@DEFECT_SIDES@@];
 var PAIRS = [@@PAIRS@@];
+
+var REASON_LABELS = {@@REASON_LABELS@@};
+var DEFECT_LABELS = {@@DEFECT_LABELS@@};
+
+var hasAttemptedExport = false;
+
 var state = {};
 PAIRS.forEach(function (pair) {
   state[pair.id] = { choice: "", tags: [], defect: "", side: "", note: "" };
 });
+
 function el(tag, attrs, text) {
   var node = document.createElement(tag);
   for (var k in attrs) { node.setAttribute(k, attrs[k]); }
-  if (text !== undefined) { node.appendChild(document.createTextNode(text)); }
+  if (text !== undefined && text !== null) { node.appendChild(document.createTextNode(text)); }
   return node;
 }
+
 function rebuild() {
   var container = document.getElementById("pairs");
   container.textContent = "";
   PAIRS.forEach(function (pair) {
     var s = state[pair.id];
-    var block = el("section", { "class": "pair" });
+    var block = el("section", { "class": "pair", "id": "pair_" + pair.id });
     block.appendChild(el("h2", {}, "Pair " + pair.id));
     var images = el("div", { "class": "images" });
     var left = el("figure", { "class": "image" });
@@ -929,19 +970,27 @@ function rebuild() {
     images.appendChild(right);
     block.appendChild(images);
     var controls = el("div", { "class": "controls" });
+
+    var choiceSec = el("div", { "class": "section-block" });
+    choiceSec.appendChild(el("span", { "class": "lbl" }, "Preference (required): "));
+    var choiceFlex = el("div", { "class": "flex-group choice-group" });
     ["LEFT", "RIGHT", "TIE"].forEach(function (choice) {
-      var label = el("label", {});
+      var label = el("label", { "class": "radio-unit" });
       var radio = el("input", { "type": "radio", "name": "choice_" + pair.id, "value": choice });
       if (s.choice === choice) { radio.setAttribute("checked", "checked"); }
       radio.addEventListener("change", function () { s.choice = choice; refresh(); });
       label.appendChild(radio);
       label.appendChild(document.createTextNode(choice === "LEFT" ? " Left is better" : choice === "RIGHT" ? " Right is better" : " Tie"));
-      controls.appendChild(label);
+      choiceFlex.appendChild(label);
     });
-    controls.appendChild(el("br", {}));
-    controls.appendChild(el("span", { "class": "lbl" }, "Reason tags: "));
+    choiceSec.appendChild(choiceFlex);
+    controls.appendChild(choiceSec);
+
+    var tagSec = el("div", { "class": "section-block" });
+    tagSec.appendChild(el("span", { "class": "lbl" }, "Reason tags (optional analysis categories): "));
+    var tagFlex = el("div", { "class": "flex-group tags-group" });
     REASON_TAGS.forEach(function (tag) {
-      var label = el("label", { "class": "tag" });
+      var label = el("label", { "class": "tag-unit" });
       var box = el("input", { "type": "checkbox", "value": tag });
       if (s.tags.indexOf(tag) >= 0) { box.setAttribute("checked", "checked"); }
       box.addEventListener("change", function () {
@@ -950,21 +999,29 @@ function rebuild() {
         refresh();
       });
       label.appendChild(box);
-      label.appendChild(document.createTextNode(tag));
-      controls.appendChild(label);
+      label.appendChild(document.createTextNode(REASON_LABELS[tag] || tag));
+      tagFlex.appendChild(label);
     });
-    controls.appendChild(el("br", {}));
-    controls.appendChild(el("span", { "class": "lbl" }, "Critical defect: "));
+    tagSec.appendChild(tagFlex);
+    controls.appendChild(tagSec);
+
+    var fieldset = el("fieldset", { "class": "critical-panel" });
+    fieldset.appendChild(el("legend", {}, "Critical defect: use only when unusable"));
+    var critFlex = el("div", { "class": "flex-group" });
+    var defectLabel = el("label", { "for": "defect_" + pair.id, "class": "lbl" }, "Tag: ");
+    critFlex.appendChild(defectLabel);
     var defectSelect = el("select", { "id": "defect_" + pair.id });
     defectSelect.appendChild(el("option", { "value": "" }, "(none)"));
     DEFECT_TAGS.forEach(function (tag) {
-      var opt = el("option", { "value": tag }, tag);
+      var opt = el("option", { "value": tag }, DEFECT_LABELS[tag] || tag);
       if (s.defect === tag) { opt.setAttribute("selected", "selected"); }
       defectSelect.appendChild(opt);
     });
     defectSelect.addEventListener("change", function () { s.defect = defectSelect.value; refresh(); });
-    controls.appendChild(defectSelect);
-    controls.appendChild(el("span", { "class": "lbl" }, " Defect side: "));
+    critFlex.appendChild(defectSelect);
+
+    var sideLabel = el("label", { "for": "side_" + pair.id, "class": "lbl" }, " Defect side: ");
+    critFlex.appendChild(sideLabel);
     var sideSelect = el("select", { "id": "side_" + pair.id });
     sideSelect.appendChild(el("option", { "value": "" }, "(none)"));
     DEFECT_SIDES.forEach(function (side) {
@@ -973,17 +1030,71 @@ function rebuild() {
       sideSelect.appendChild(opt);
     });
     sideSelect.addEventListener("change", function () { s.side = sideSelect.value; refresh(); });
-    controls.appendChild(sideSelect);
-    controls.appendChild(el("br", {}));
-    controls.appendChild(el("span", { "class": "lbl" }, "Note: "));
-    var note = el("textarea", { "rows": "2", "cols": "60" });
+    critFlex.appendChild(sideSelect);
+    fieldset.appendChild(critFlex);
+    controls.appendChild(fieldset);
+
+    var noteSec = el("div", { "class": "section-block" });
+    var noteLabel = el("label", { "for": "note_" + pair.id, "class": "lbl" }, "Note: ");
+    noteSec.appendChild(noteLabel);
+    var note = el("textarea", {
+      "id": "note_" + pair.id,
+      "rows": "2",
+      "cols": "60",
+      "placeholder": "Optional detail: contrast, shadows, sharpening, tone, or anything else you noticed."
+    });
     note.value = s.note;
     note.addEventListener("input", function () { s.note = note.value; refresh(); });
-    controls.appendChild(note);
+    noteSec.appendChild(note);
+    controls.appendChild(noteSec);
+
     block.appendChild(controls);
     container.appendChild(block);
   });
 }
+
+function validateDraft() {
+  var errors = [];
+  var answeredCount = 0;
+  PAIRS.forEach(function (pair) {
+    var s = state[pair.id];
+    var pairErrors = [];
+    if (s.choice === "LEFT" || s.choice === "RIGHT" || s.choice === "TIE") {
+      answeredCount++;
+    } else {
+      pairErrors.push("Preference choice (Left, Right, or Tie) is required");
+    }
+
+    if ((s.defect !== "" && s.side === "") || (s.defect === "" && s.side !== "")) {
+      pairErrors.push("Critical defect tag and side must be set together or both empty");
+    }
+
+    if (s.defect === "OTHER_PREDECLARED" && s.note.trim() === "") {
+      pairErrors.push("Other critical defect requires an explanatory note");
+    }
+
+    var block = document.getElementById("pair_" + pair.id);
+    if (block) {
+      if (hasAttemptedExport && pairErrors.length > 0) {
+        block.classList.add("invalid");
+      } else {
+        block.classList.remove("invalid");
+      }
+    }
+
+    if (pairErrors.length > 0) {
+      errors.push({ id: pair.id, messages: pairErrors });
+    }
+  });
+
+  return {
+    valid: errors.length === 0,
+    answered: answeredCount,
+    total: PAIRS.length,
+    errors: errors
+  };
+}
+
 function csvField(value) {
   var v = value == null ? "" : String(value);
   if (v.indexOf(",") >= 0 || v.indexOf("\"") >= 0 || v.indexOf("\n") >= 0 || v.indexOf("\r") >= 0) {
@@ -991,6 +1102,7 @@ function csvField(value) {
   }
   return v;
 }
+
 function buildCsv() {
   var lines = [SCHEMA.join(",")];
   PAIRS.forEach(function (pair) {
@@ -1000,10 +1112,63 @@ function buildCsv() {
   });
   return lines.join("\r\n");
 }
+
 function refresh() {
-  document.getElementById("csvArea").value = buildCsv();
+  var result = validateDraft();
+
+  var progressEl = document.getElementById("progress");
+  if (progressEl) {
+    progressEl.textContent = "Answered " + result.answered + " of " + result.total + " required pairs";
+  }
+
+  var summaryEl = document.getElementById("errorSummary");
+  if (summaryEl) {
+    summaryEl.textContent = "";
+    if (hasAttemptedExport && result.errors.length > 0) {
+      var h3 = el("h3", {}, "Please correct the following issues before exporting:");
+      summaryEl.appendChild(h3);
+      var ul = el("ul", {});
+      result.errors.forEach(function (err) {
+        var li = el("li", {});
+        var a = el("a", { "href": "#pair_" + err.id }, "Pair " + err.id + ": ");
+        li.appendChild(a);
+        li.appendChild(document.createTextNode(err.messages.join("; ")));
+        ul.appendChild(li);
+      });
+      summaryEl.appendChild(ul);
+      summaryEl.style.display = "block";
+    } else {
+      summaryEl.style.display = "none";
+    }
+  }
+
+  var csvArea = document.getElementById("csvArea");
+  if (csvArea) {
+    if (result.valid) {
+      csvArea.value = buildCsv();
+    } else {
+      csvArea.value = "";
+    }
+  }
 }
+
 document.getElementById("exportBtn").addEventListener("click", function () {
+  hasAttemptedExport = true;
+  var result = validateDraft();
+  refresh();
+  if (!result.valid) {
+    var firstInvalidId = result.errors[0].id;
+    var firstEl = document.getElementById("pair_" + firstInvalidId);
+    var summaryEl = document.getElementById("errorSummary");
+    if (summaryEl && summaryEl.style.display !== "none") { summaryEl.focus(); }
+    if (firstEl) {
+      var firstControl = firstEl.querySelector("input[type=radio]:not(:checked), select, textarea");
+      if (firstControl) { firstControl.focus(); }
+      firstEl.scrollIntoView({ behavior: "smooth" });
+    }
+    return;
+  }
+
   var csv = buildCsv();
   var blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
   var a = document.createElement("a");
@@ -1013,23 +1178,43 @@ document.getElementById("exportBtn").addEventListener("click", function () {
   a.click();
   document.body.removeChild(a);
 });
+
 rebuild();
 refresh();
 """.trimIndent()
 
         val css = """
+*, *:before, *:after { box-sizing: border-box; }
 body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2em auto; padding: 0 1em; color: #222; }
-img { max-width: 100%; border: 1px solid #ddd; }
-.pair { border: 1px solid #ccc; margin-bottom: 2em; padding: 1em; }
-.images { display: flex; gap: 1em; }
-.image { flex: 1; }
-.controls { margin-top: 0.5em; }
-.controls label { margin-right: 0.8em; }
-.controls .lbl { font-weight: bold; margin-right: 0.4em; }
-.controls .tag { font-size: 0.85em; }
-.controls textarea, #csvArea { font-family: monospace; width: 100%; }
-.toolbar { margin: 1em 0; }
-.notice, .hint { font-size: 0.9em; color: #555; }
+img { max-width: 100%; height: auto; border: 1px solid #ddd; display: block; }
+.pair { border: 1px solid #ccc; margin-bottom: 2em; padding: 1em; border-radius: 4px; max-width: 100%; }
+.pair.invalid { border: 2px solid #d9534f; background-color: #fff9f9; }
+.images { display: flex; flex-wrap: wrap; gap: 1em; margin-bottom: 1em; max-width: 100%; }
+.image { flex: 1 1 300px; min-width: 0; max-width: 100%; margin: 0; }
+.controls { margin-top: 0.5em; max-width: 100%; }
+.section-block { margin-bottom: 0.8em; max-width: 100%; }
+.flex-group { display: flex; flex-wrap: wrap; gap: 0.5em 1em; align-items: center; max-width: 100%; }
+.radio-unit, .tag-unit { display: inline-flex; align-items: center; white-space: nowrap; font-size: 0.9em; cursor: pointer; }
+.radio-unit input, .tag-unit input { margin-right: 0.4em; }
+.controls .lbl { font-weight: bold; margin-right: 0.4em; display: inline-block; }
+.critical-panel { border: 1px solid #e0e0e0; background: #fafafa; padding: 0.8em; margin: 0.8em 0; border-radius: 4px; max-width: 100%; }
+.critical-panel legend { font-weight: bold; padding: 0 0.4em; color: #c9302c; }
+select, textarea, input { max-width: 100%; }
+.controls textarea, #csvArea { font-family: monospace; width: 100%; box-sizing: border-box; max-width: 100%; }
+.toolbar { margin: 1.5em 0; padding: 1em; background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; max-width: 100%; }
+.progress { font-weight: bold; font-size: 1.1em; margin: 1em 0; color: #2e6da4; }
+.error-summary { background: #f2dede; border: 1px solid #ebccd1; color: #a94442; padding: 1em; margin: 1em 0; border-radius: 4px; display: none; max-width: 100%; }
+.error-summary h3 { margin-top: 0; margin-bottom: 0.5em; font-size: 1em; }
+.error-summary ul { margin: 0; padding-left: 1.5em; }
+.error-summary a { color: #843534; font-weight: bold; text-decoration: underline; }
+.notice, .hint { font-size: 0.9em; color: #555; line-height: 1.4; max-width: 100%; }
+
+@media (max-width: 600px) {
+  body { margin: 1em auto; padding: 0 0.5em; }
+  .pair { padding: 0.5em; }
+  .images { gap: 0.5em; }
+  .image { flex: 1 1 100%; }
+}
 """.trimIndent()
 
         return Page(
@@ -1039,6 +1224,8 @@ img { max-width: 100%; border: 1px solid #ddd; }
                 .replace("@@REASON_TAGS@@", tagsJs)
                 .replace("@@DEFECT_TAGS@@", defectsJs)
                 .replace("@@DEFECT_SIDES@@", defectSidesJs)
+                .replace("@@REASON_LABELS@@", reasonLabelsJs)
+                .replace("@@DEFECT_LABELS@@", defectLabelsJs)
                 .replace("@@PAIRS@@", pairsJs),
             css = css,
         )

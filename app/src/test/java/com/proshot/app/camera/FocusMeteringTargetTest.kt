@@ -457,7 +457,7 @@ class FocusMeteringTargetTest {
         val activeArray = PureRect(left = 0, top = 0, right = 4000, bottom = 3000)
         val cropRegion = PureRect(left = 0, top = 375, right = 4000, bottom = 2625) // 16:9 crop
 
-        // Tap at sensor y=0 (top of visible content) — without crop clamping,
+        // Tap at sensor y=0 (top of visible content), without crop clamping,
         // the AF rectangle would extend above the crop into the non-visible area.
         val topEdgeTarget = FocusMeteringTarget.tap(0.5f, 0.0f)
         val mappedTop = FocusMeteringCoordinateMapper.mapToActiveArray(
@@ -466,7 +466,7 @@ class FocusMeteringTargetTest {
         assertTrue("AF top must stay inside crop", mappedTop.top >= cropRegion.top)
         assertTrue("AF bottom must stay inside crop", mappedTop.bottom <= cropRegion.bottom)
 
-        // Tap at sensor y=1 (bottom of visible content) — without crop clamping,
+        // Tap at sensor y=1 (bottom of visible content), without crop clamping,
         // the AF rectangle would extend below the crop.
         val bottomEdgeTarget = FocusMeteringTarget.tap(0.5f, 1.0f)
         val mappedBottom = FocusMeteringCoordinateMapper.mapToActiveArray(
