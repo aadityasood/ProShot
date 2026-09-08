@@ -7,7 +7,9 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.security.SecureRandom
 import java.util.Random
 import javax.imageio.IIOImage
@@ -36,9 +38,9 @@ internal fun guardOutDir(outDir: Path) {
     }
 }
 
-/** Refuses any pre-existing destination file that would otherwise be overwritten. */
+/** Requires confirmed absence of the final directory entry without following symbolic links. */
 internal fun guardNewFile(path: Path) {
-    if (Files.exists(path)) {
+    if (!Files.notExists(path, LinkOption.NOFOLLOW_LINKS)) {
         throw ToolError(Codes.OUT_PATH_EXISTS, "refusing to overwrite existing path: '$path'")
     }
 }
@@ -758,7 +760,7 @@ internal object ReviewPackage {
             Files.write(outDir.resolve("review.js"), jsBytes)
             Files.write(outDir.resolve("review.css"), cssBytes)
             Files.write(outDir.resolve("manifest.properties"), manifestBytes)
-            Files.write(keyPath, keyBytes)
+            Files.write(keyPath, keyBytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
         } catch (e: IOException) {
             throw ToolError(Codes.FILE_WRITE, "failed to write reviewer package: ${e.message}", ToolExitCode.IO)
         }
@@ -779,28 +781,22 @@ internal object ReviewPackage {
     }
 
     /**
-     * Rejects a private key whose physically resolved projected location equals
-     * or lies under the physically resolved projected package location.
+     * Rejects a private key whose physically resolved location equals or lies
+     * under the physically resolved package location.
      *
-     * Lexical comparison alone is insufficient when an existing parent is a
-     * symlink or junction, so both not-yet-created paths are projected from the
-     * real path of their existing parent directory. Missing or invalid parents
-     * fail closed with a stable error. No ACL is created, modified, or tested.
+     * Lexical comparison alone is insufficient when an existing parent or the
+     * existing output directory is a symlink or junction. An existing output
+     * directory is resolved directly via toRealPath(); an absent output directory
+     * is projected from the real path of its existing parent directory. The key
+     * path is always projected from the real path of its existing parent directory.
+     * Missing or invalid parents fail closed with a stable error. No ACL is
+     * created, modified, or tested.
      */
     private fun rejectKeyInsidePackageResolved(outDir: Path, keyPath: Path) {
         val outAbs = outDir.toAbsolutePath().normalize()
         val keyAbs = keyPath.toAbsolutePath().normalize()
-        val outParent = outAbs.parent
-            ?: throw ToolError(Codes.PATH_IO, "package output path has no parent directory: '$outDir'", ToolExitCode.IO)
         val keyParent = keyAbs.parent
             ?: throw ToolError(Codes.PATH_IO, "key path has no parent directory: '$keyPath'", ToolExitCode.IO)
-        if (!Files.isDirectory(outParent)) {
-            throw ToolError(
-                Codes.PATH_IO,
-                "package output parent directory does not exist: '$outParent'",
-                ToolExitCode.IO,
-            )
-        }
         if (!Files.isDirectory(keyParent)) {
             throw ToolError(
                 Codes.PATH_IO,
@@ -808,22 +804,41 @@ internal object ReviewPackage {
                 ToolExitCode.IO,
             )
         }
-        val realOutParent = try {
-            outParent.toRealPath()
-        } catch (e: IOException) {
-            throw ToolError(Codes.PATH_IO, "cannot resolve real package parent '$outParent': ${e.message}", ToolExitCode.IO)
-        }
         val realKeyParent = try {
             keyParent.toRealPath()
         } catch (e: IOException) {
             throw ToolError(Codes.PATH_IO, "cannot resolve real key parent '$keyParent': ${e.message}", ToolExitCode.IO)
         }
-        val projectedOut = realOutParent.resolve(outAbs.fileName)
         val projectedKey = realKeyParent.resolve(keyAbs.fileName)
-        if (projectedKey == projectedOut || projectedKey.startsWith(projectedOut)) {
+
+        val physicalOut = if (Files.exists(outDir)) {
+            try {
+                outDir.toRealPath()
+            } catch (e: IOException) {
+                throw ToolError(Codes.PATH_IO, "cannot resolve real package output directory '$outDir': ${e.message}", ToolExitCode.IO)
+            }
+        } else {
+            val outParent = outAbs.parent
+                ?: throw ToolError(Codes.PATH_IO, "package output path has no parent directory: '$outDir'", ToolExitCode.IO)
+            if (!Files.isDirectory(outParent)) {
+                throw ToolError(
+                    Codes.PATH_IO,
+                    "package output parent directory does not exist: '$outParent'",
+                    ToolExitCode.IO,
+                )
+            }
+            val realOutParent = try {
+                outParent.toRealPath()
+            } catch (e: IOException) {
+                throw ToolError(Codes.PATH_IO, "cannot resolve real package parent '$outParent': ${e.message}", ToolExitCode.IO)
+            }
+            realOutParent.resolve(outAbs.fileName)
+        }
+
+        if (projectedKey == physicalOut || projectedKey.startsWith(physicalOut)) {
             throw ToolError(
                 Codes.KEY_INSIDE_PACKAGE,
-                "key path must not be inside the reviewer package (resolved: '$projectedKey' under '$projectedOut')",
+                "key path must not be inside the reviewer package (resolved: '$projectedKey' under '$physicalOut')",
             )
         }
     }
