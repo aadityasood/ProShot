@@ -4,11 +4,13 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.awt.Color
 import java.awt.image.BufferedImage
 import java.awt.image.IndexColorModel
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 import java.nio.charset.StandardCharsets
@@ -851,5 +853,150 @@ class CommandLineIntegrationTest {
         assertEquals(1, cli("nonsense"))
         assertEquals(1, cli("validate"))
         assertEquals(1, cli("validate", "--bogus", "x", "--root", "r", "--out-dir", "o"))
+    }
+
+    @Test
+    fun sharedCliEntryPointEnforcesMemoryOnlyImageIoPolicy() {
+        val sampleImageBytes = TestData.syntheticPng()
+
+        val calRoot = temp.resolve("imageio-cal-root")
+        TestData.writeStandardDataset(calRoot, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val calPkg = temp.resolve("imageio-cal-pkg")
+        val calKey = temp.resolve("imageio-cal-key")
+
+        val badRoot = temp.resolve("imageio-bad-root")
+        TestData.writeStandardDataset(badRoot, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val badImageBytes = "GIF89a".toByteArray(StandardCharsets.US_ASCII)
+        val badImageFormat = ReviewSource.detectFormat(badImageBytes)
+        assertEquals("gif", badImageFormat)
+        assertEquals(1, ReviewSource.exifOrientation(badImageBytes, badImageFormat))
+        val badImagePath = badRoot.resolve("originals/TRIAL_baseline_pass_a_city_sun_1.png")
+        Files.write(badImagePath, badImageBytes)
+        val updatedTrials = DatasetModel.load(badRoot).trials.map { t ->
+            if (t.trialId == "TRIAL_baseline_pass_a_city_sun_1") {
+                val hash = Hashes.sha256(badImageBytes)
+                val size = badImageBytes.size.toLong()
+                t.copy(
+                    originalHashSha256 = hash,
+                    originalByteSize = size,
+                    reviewSourceHashSha256 = hash,
+                    reviewSourceByteSize = size,
+                )
+            } else {
+                t
+            }
+        }
+        TestData.writeTrialsCsv(badRoot, updatedTrials)
+        val badPkg = temp.resolve("imageio-bad-pkg")
+        val badKey = temp.resolve("imageio-bad-key")
+
+        val priorUseCache = ImageIO.getUseCache()
+        val priorCacheDirectory = ImageIO.getCacheDirectory()
+        val isolatedCacheDir = temp.resolve("isolated-imageio-cache")
+        Files.createDirectories(isolatedCacheDir)
+
+        try {
+            ImageIO.setCacheDirectory(isolatedCacheDir.toFile())
+
+            ImageIO.setUseCache(true)
+            val usageCode = cli()
+            assertEquals(ToolExitCode.USAGE.value, usageCode)
+            assertFalse("CLI entry point must disable ImageIO disk caching before dispatch", ImageIO.getUseCache())
+
+            val testIn = ImageIO.createImageInputStream(ByteArrayInputStream(sampleImageBytes))
+            assertNotNull(testIn)
+            try {
+                assertFalse("Input stream must not be file-cached while open", testIn.isCachedFile)
+                assertTrue("Input stream must be memory-cached", testIn.isCachedMemory)
+                assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+            } finally {
+                testIn.close()
+            }
+
+            val testOut = ImageIO.createImageOutputStream(ByteArrayOutputStream())
+            assertNotNull(testOut)
+            try {
+                assertFalse("Output stream must not be file-cached while open", testOut.isCachedFile)
+                assertTrue("Output stream must be memory-cached", testOut.isCachedMemory)
+                assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+            } finally {
+                testOut.close()
+            }
+
+            ImageIO.setUseCache(true)
+            val successCode = cli(
+                "blind",
+                "--root", "$calRoot",
+                "--out-dir", "$calPkg",
+                "--key", "$calKey",
+                "--seed", SEED,
+            )
+            assertEquals(0, successCode)
+            assertFalse("Disk caching must remain disabled after successful blind dispatch", ImageIO.getUseCache())
+            assertTrue(Files.isRegularFile(calPkg.resolve("manifest.properties")))
+            assertTrue(Files.isRegularFile(calKey))
+
+            val postSuccessIn = ImageIO.createImageInputStream(ByteArrayInputStream(sampleImageBytes))
+            assertNotNull(postSuccessIn)
+            try {
+                assertFalse(postSuccessIn.isCachedFile)
+                assertTrue(postSuccessIn.isCachedMemory)
+                assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+            } finally {
+                postSuccessIn.close()
+            }
+            assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+
+            val failureOutput = ByteArrayOutputStream()
+            val priorErr = System.err
+            PrintStream(failureOutput, true, StandardCharsets.UTF_8).use { failureErr ->
+                try {
+                    System.setErr(failureErr)
+                    ImageIO.setUseCache(true)
+                    val failCode = cli(
+                        "blind",
+                        "--root", "$badRoot",
+                        "--out-dir", "$badPkg",
+                        "--key", "$badKey",
+                        "--seed", SEED,
+                    )
+                    assertEquals(ToolExitCode.GATE.value, failCode)
+                } finally {
+                    System.setErr(priorErr)
+                }
+            }
+            val failureMessage = failureOutput.toString(StandardCharsets.UTF_8).trim()
+            assertEquals(
+                "ERROR ${Codes.VALIDATION_FAILED}: dataset is not eligible for blinding (1 critical finding(s)); run validate first",
+                failureMessage,
+            )
+            assertFalse("Disk caching must remain disabled after failed decode path", ImageIO.getUseCache())
+            assertFalse(Files.exists(badPkg))
+            assertFalse(Files.exists(badKey))
+
+            val failedValidation = DatasetValidator.validateDataset(badRoot)
+            assertFalse(failedValidation.ok)
+            val criticalIssues = failedValidation.critical()
+            assertEquals(1, criticalIssues.size)
+            val decodeIssue = criticalIssues.single()
+            assertEquals(Codes.REVIEW_SOURCE_UNDECODABLE, decodeIssue.code)
+            assertTrue(decodeIssue.evidence, decodeIssue.evidence.contains("ImageIO could not decode review source"))
+            assertFalse("Disk caching must remain disabled after validation", ImageIO.getUseCache())
+
+            val postFailOut = ImageIO.createImageOutputStream(ByteArrayOutputStream())
+            assertNotNull(postFailOut)
+            try {
+                assertFalse(postFailOut.isCachedFile)
+                assertTrue(postFailOut.isCachedMemory)
+                assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+            } finally {
+                postFailOut.close()
+            }
+            assertEquals(0L, Files.list(isolatedCacheDir).use { it.count() })
+        } finally {
+            // Restore prior global ImageIO configuration so other tests are not contaminated.
+            ImageIO.setUseCache(priorUseCache)
+            ImageIO.setCacheDirectory(priorCacheDirectory)
+        }
     }
 }

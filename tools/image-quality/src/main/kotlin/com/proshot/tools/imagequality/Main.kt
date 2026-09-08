@@ -3,6 +3,7 @@ package com.proshot.tools.imagequality
 import java.io.IOException
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
+import javax.imageio.ImageIO
 import kotlin.system.exitProcess
 
 const val TOOL_NAME = "proshot-image-quality"
@@ -165,6 +166,7 @@ fun main(args: Array<String>) {
 }
 
 internal fun runCli(args: Array<String>): Int {
+    ImageIO.setUseCache(false)
     if (args.isEmpty()) {
         printUsage()
         return ToolExitCode.USAGE.value

@@ -6,12 +6,18 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.PrintStream
 import java.nio.charset.StandardCharsets
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import javax.imageio.ImageIO
 
@@ -482,22 +488,222 @@ class ReviewPackageTest {
     }
 
     @Test
+    fun danglingFinalKeyPathSymbolicLinkIntoPhysicalPackageRejectedBeforeWritesWhenHostPermits() {
+        val root = temp.resolve("keyloc-final-link-root")
+        TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val physicalPkg = temp.resolve("keyloc-final-link-pkg")
+        Files.createDirectories(physicalPkg)
+        val linkTarget = physicalPkg.resolve("compromised.key")
+        val keyAlias = temp.resolve("keyloc-final-link.key")
+        assertTrue(Files.notExists(keyAlias, LinkOption.NOFOLLOW_LINKS))
+        assertTrue(Files.notExists(linkTarget, LinkOption.NOFOLLOW_LINKS))
+        assertEquals(0L, Files.list(physicalPkg).use { it.count() })
+        val linkCreated = try {
+            Files.createSymbolicLink(keyAlias, linkTarget)
+            true
+        } catch (e: Exception) {
+            if (Files.isSymbolicLink(keyAlias)) Files.deleteIfExists(keyAlias)
+            when (e) {
+                is FileAlreadyExistsException, is NoSuchFileException -> throw e
+                is IOException, is UnsupportedOperationException, is SecurityException -> {
+                    System.err.println("SYMLINK_CREATION_UNAVAILABLE: ${e.javaClass.simpleName}: ${e.message}")
+                    false
+                }
+                else -> throw e
+            }
+        }
+        assumeTrue("SYMLINK_CREATION_UNAVAILABLE: final key-path symbolic-link containment not exercised", linkCreated)
+
+        try {
+            assertTrue(Files.isSymbolicLink(keyAlias))
+            assertFalse(Files.exists(keyAlias))
+            val failureOutput = ByteArrayOutputStream()
+            val priorErr = System.err
+            PrintStream(failureOutput, true, StandardCharsets.UTF_8).use { failureErr ->
+                try {
+                    System.setErr(failureErr)
+                    val failCode = blind(
+                        root, physicalPkg, keyAlias,
+                        "1010101010101010101010101010101010101010101010101010101010101010",
+                    )
+                    assertEquals(ToolExitCode.GATE.value, failCode)
+                } finally {
+                    System.setErr(priorErr)
+                }
+            }
+            val failureMessage = failureOutput.toString(StandardCharsets.UTF_8).trim()
+            assertTrue(failureMessage, failureMessage.startsWith("ERROR ${Codes.OUT_PATH_EXISTS}: "))
+            assertTrue(Files.isSymbolicLink(keyAlias))
+            assertTrue(Files.notExists(linkTarget, LinkOption.NOFOLLOW_LINKS))
+            assertTrue(Files.notExists(physicalPkg.resolve("manifest.properties"), LinkOption.NOFOLLOW_LINKS))
+            assertEquals(0L, Files.list(physicalPkg).use { it.count() })
+        } finally {
+            Files.deleteIfExists(keyAlias)
+        }
+    }
+
+    @Test
     fun keyInsidePackageRejectedThroughResolvedParentLinksWhenHostPermits() {
         val root = temp.resolve("keyloc-link-root")
         TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
         val pkg = temp.resolve("keyloc-link-pkg")
         Files.createDirectories(pkg)
         val alias = temp.resolve("keyloc-link-alias")
-        try {
+        val linkCreated = try {
             Files.createSymbolicLink(alias, pkg)
+            true
         } catch (e: Exception) {
+            Files.deleteIfExists(alias)
             System.err.println("SYMLINK_CREATION_UNAVAILABLE: host denied link creation; resolved-parent key containment not exercised")
-            return
+            false
         }
-        // The key is lexically OUTSIDE the package (under 'alias') but its real
-        // parent resolves into the package, so it must be rejected.
-        val code = runCli(arrayOf("blind", "--root", "$root", "--out-dir", "$pkg", "--key", "${alias.resolve("inside.key")}", "--seed", "1010101010101010101010101010101010101010101010101010101010101010"))
-        assertNotEquals(0, code)
+        assumeTrue("SYMLINK_CREATION_UNAVAILABLE: host denied link creation; resolved-parent key containment not exercised", linkCreated)
+
+        try {
+            val code = runCli(arrayOf("blind", "--root", "$root", "--out-dir", "$pkg", "--key", "${alias.resolve("inside.key")}", "--seed", "1010101010101010101010101010101010101010101010101010101010101010"))
+            assertNotEquals(0, code)
+        } finally {
+            // Clean up the test-owned alias without modifying the target directory.
+            Files.deleteIfExists(alias)
+        }
+    }
+
+    @Test
+    fun keyInsidePhysicalPackageViaOutputDirectorySymlinkRejectedWhenHostPermits() {
+        val root = temp.resolve("keyloc-outlink-root")
+        TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val physicalPkg = temp.resolve("keyloc-physical-pkg")
+        Files.createDirectories(physicalPkg)
+        val outAlias = temp.resolve("keyloc-outlink-alias")
+        val linkCreated = try {
+            Files.createSymbolicLink(outAlias, physicalPkg)
+            true
+        } catch (e: Exception) {
+            Files.deleteIfExists(outAlias)
+            System.err.println("SYMLINK_CREATION_UNAVAILABLE: host denied link creation; output symlink containment not exercised")
+            false
+        }
+        assumeTrue("SYMLINK_CREATION_UNAVAILABLE: host denied link creation; output symlink containment not exercised", linkCreated)
+
+        try {
+            val compromisedKey = physicalPkg.resolve("compromised.key")
+            val failCode = runCli(
+                arrayOf(
+                    "blind",
+                    "--root", "$root",
+                    "--out-dir", "$outAlias",
+                    "--key", "$compromisedKey",
+                    "--seed", "1010101010101010101010101010101010101010101010101010101010101010",
+                ),
+            )
+            assertNotEquals(0, failCode)
+            assertFalse(Files.exists(compromisedKey))
+            assertFalse(Files.exists(physicalPkg.resolve("manifest.properties")))
+            assertEquals(0L, Files.list(physicalPkg).use { it.count() })
+
+            val outsideKey = temp.resolve("keyloc-outside.key")
+            val successCode = runCli(
+                arrayOf(
+                    "blind",
+                    "--root", "$root",
+                    "--out-dir", "$outAlias",
+                    "--key", "$outsideKey",
+                    "--seed", "1010101010101010101010101010101010101010101010101010101010101010",
+                ),
+            )
+            assertEquals(0, successCode)
+            assertTrue(Files.isRegularFile(physicalPkg.resolve("manifest.properties")))
+            assertTrue(Files.isRegularFile(outsideKey))
+        } finally {
+            // Clean up the test-owned alias without modifying the target directory.
+            Files.deleteIfExists(outAlias)
+        }
+    }
+
+    private fun tryCreateWindowsJunction(junction: Path, target: Path): Boolean {
+        val os = System.getProperty("os.name") ?: ""
+        if (!os.contains("Windows", ignoreCase = true)) {
+            return false
+        }
+        return try {
+            val process = ProcessBuilder("cmd", "/c", "mklink", "/J", junction.toString(), target.toString())
+                .redirectErrorStream(true)
+                .start()
+            val exit = process.waitFor()
+            exit == 0 && Files.isDirectory(junction)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @Test
+    fun keyInsidePhysicalPackageViaOutputDirectoryJunctionRejectedOnWindowsWhenPermitted() {
+        val os = System.getProperty("os.name") ?: ""
+        val isWindows = os.contains("Windows", ignoreCase = true)
+        if (!isWindows) {
+            System.err.println("JUNCTION_CREATION_UNAVAILABLE: host is not Windows ($os); Windows junction coverage skipped")
+        }
+        assumeTrue("JUNCTION_CREATION_UNAVAILABLE: host is not Windows ($os); Windows junction coverage skipped", isWindows)
+
+        val root = temp.resolve("keyloc-junction-root")
+        TestData.writeStandardDataset(root, DatasetKind.CALIBRATION, TestData.calibrationComparisons())
+        val physicalPkg = temp.resolve("keyloc-junction-physical-pkg")
+        Files.createDirectories(physicalPkg)
+        val outJunction = temp.resolve("keyloc-junction-alias")
+
+        val created = tryCreateWindowsJunction(outJunction, physicalPkg)
+        if (!created) {
+            // Ensure any partially created test-owned alias is safely removed before skipping.
+            try {
+                Files.deleteIfExists(outJunction)
+            } catch (e: Exception) {
+                try {
+                    ProcessBuilder("cmd", "/c", "rmdir", outJunction.toString()).start().waitFor()
+                } catch (_: Exception) {}
+            }
+            System.err.println("JUNCTION_CREATION_UNAVAILABLE: host denied junction creation; Windows junction containment not exercised")
+        }
+        assumeTrue("JUNCTION_CREATION_UNAVAILABLE: host denied junction creation; Windows junction containment not exercised", created)
+
+        try {
+            val compromisedKey = physicalPkg.resolve("compromised.key")
+            val failCode = runCli(
+                arrayOf(
+                    "blind",
+                    "--root", "$root",
+                    "--out-dir", "$outJunction",
+                    "--key", "$compromisedKey",
+                    "--seed", "1010101010101010101010101010101010101010101010101010101010101010",
+                ),
+            )
+            assertNotEquals(0, failCode)
+            assertFalse(Files.exists(compromisedKey))
+            assertFalse(Files.exists(physicalPkg.resolve("manifest.properties")))
+            assertEquals(0L, Files.list(physicalPkg).use { it.count() })
+
+            val outsideKey = temp.resolve("keyloc-junction-outside.key")
+            val successCode = runCli(
+                arrayOf(
+                    "blind",
+                    "--root", "$root",
+                    "--out-dir", "$outJunction",
+                    "--key", "$outsideKey",
+                    "--seed", "1010101010101010101010101010101010101010101010101010101010101010",
+                ),
+            )
+            assertEquals(0, successCode)
+            assertTrue(Files.isRegularFile(physicalPkg.resolve("manifest.properties")))
+            assertTrue(Files.isRegularFile(outsideKey))
+        } finally {
+            // Windows directory junctions must be unlinked without deleting target directory contents.
+            try {
+                Files.deleteIfExists(outJunction)
+            } catch (e: Exception) {
+                try {
+                    ProcessBuilder("cmd", "/c", "rmdir", outJunction.toString()).start().waitFor()
+                } catch (_: Exception) {}
+            }
+        }
     }
 
     @Test
