@@ -4,6 +4,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -11,6 +12,7 @@ import org.junit.Test
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.IOException
 import java.io.PrintStream
 import java.nio.charset.StandardCharsets
@@ -19,6 +21,9 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.NoSuchFileException
 import java.nio.file.Path
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import java.util.zip.DeflaterOutputStream
 import javax.imageio.ImageIO
 
 class ReviewPackageTest {
@@ -42,6 +47,35 @@ class ReviewPackageTest {
             pos += 8 + len + 4
         }
         return types
+    }
+
+    private fun onePixelPngWithUncompressedIdat(): ByteArray {
+        val ihdr = byteArrayOf(0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0)
+        // Filter zero followed by RGB bytes. Stored deflate blocks retain the literal token.
+        val scanline = byteArrayOf(0, 'S'.code.toByte(), '0'.code.toByte(), '1'.code.toByte())
+        val idat = ByteArrayOutputStream()
+        val deflater = Deflater(Deflater.NO_COMPRESSION)
+        try {
+            DeflaterOutputStream(idat, deflater).use { it.write(scanline) }
+        } finally {
+            deflater.end()
+        }
+        val png = ByteArrayOutputStream()
+        DataOutputStream(png).use { out ->
+            out.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+            for ((type, data) in listOf("IHDR" to ihdr, "IDAT" to idat.toByteArray(), "IEND" to byteArrayOf())) {
+                val typeBytes = type.toByteArray(StandardCharsets.US_ASCII)
+                val crc = CRC32().apply {
+                    update(typeBytes)
+                    update(data)
+                }
+                out.writeInt(data.size)
+                out.write(typeBytes)
+                out.write(data)
+                out.writeInt(crc.value.toInt())
+            }
+        }
+        return png.toByteArray()
     }
 
     /** Two-arm candidate dataset used to exercise a single comparison without A/A constraints. */
@@ -135,7 +169,7 @@ class ReviewPackageTest {
             val bytes = Files.readAllBytes(png)
             val types = chunkTypes(bytes)
             assertFalse("source metadata survived into $png", types.contains("tEXt"))
-            assertFalse(String(bytes, StandardCharsets.ISO_8859_1).contains("SECRET"))
+            Png.validateChunks(bytes)
         }
     }
 
@@ -215,13 +249,117 @@ class ReviewPackageTest {
             addAll(trials.mapNotNull { it.originalHashSha256 })
             addAll(listOf("baseline_pass_a", "baseline_pass_b", "TEST-PHONE-ABC123", "test-app", "camera-0"))
         }
-        val allText = TestData.listAllFiles(pkg)
-            .joinToString("\n") { String(Files.readAllBytes(it), StandardCharsets.ISO_8859_1) }
-        for (token in forbidden) {
-            assertFalse("package leaks '$token'", allText.contains(token))
+        for (file in TestData.listAllFiles(pkg)) {
+            val name = pkg.relativize(file).toString().replace('\\', '/')
+            for (token in forbidden) {
+                assertFalse("package path '$name' leaks '$token'", name.contains(token))
+            }
+            when (name) {
+                "review.html", "review.js", "review.css", "manifest.properties" -> {
+                    val text = Files.readString(file, StandardCharsets.UTF_8)
+                    for (token in forbidden) {
+                        assertFalse("$name leaks '$token'", text.contains(token))
+                    }
+                }
+                else -> {
+                    assertEquals("asset must be directly under assets/", "assets", name.substringBeforeLast('/'))
+                    val assetName = name.substringAfterLast('/')
+                    assertTrue("asset must have a PNG filename", assetName.endsWith(".png") && assetName.length > 4)
+                    Png.validateChunks(Files.readAllBytes(file))
+                }
+            }
         }
         // The key must NOT be part of the package.
         assertFalse(PathSecurity.isStrictlyUnder(key, pkg))
+    }
+
+    @Test
+    fun privacyScanIgnoresLiteralSceneTokenInPngIdat() {
+        val png = onePixelPngWithUncompressedIdat()
+        val tokenBytes = "S01".toByteArray(StandardCharsets.US_ASCII).toList()
+        assertTrue("PNG must contain literal S01 bytes", png.toList().windowed(tokenBytes.size).contains(tokenBytes))
+        Png.validateChunks(png)
+        assertEquals(listOf("IHDR", "IDAT", "IEND"), chunkTypes(png))
+        val idatOffset = 8 + 12 + 13
+        val idatLength = Png.readIntBE(png, idatOffset)
+        val idat = png.copyOfRange(idatOffset + 8, idatOffset + 8 + idatLength)
+        assertTrue("IDAT must contain literal S01 bytes", idat.toList().windowed(tokenBytes.size).contains(tokenBytes))
+        val decoded = ImageIO.read(ByteArrayInputStream(png))
+        assertNotNull(decoded)
+        assertEquals(1, decoded.width)
+        assertEquals(1, decoded.height)
+        assertEquals(0x533031, decoded.getRGB(0, 0) and 0xFFFFFF)
+
+        val findings = ReviewPackage.scanReviewerPackageForPrivateContent(mapOf("assets/p01.png" to png), listOf("S01"))
+        assertTrue("binary pixel coincidence must not be a privacy finding: $findings", findings.isEmpty())
+    }
+
+    @Test
+    fun privacyScanDetectsForbiddenTokensInGeneratedPaths() {
+        val png = onePixelPngWithUncompressedIdat()
+        val pathsAndTokens = listOf(
+            "assets/S01.png" to "S01",
+            "assets/p01.png" to "assets",
+            "review.html" to "review",
+            "review.js" to "review",
+            "review.css" to "review",
+            "manifest.properties" to "manifest",
+        )
+        for ((name, token) in pathsAndTokens) {
+            val bytes = if (name.startsWith("assets/")) png else byteArrayOf()
+            assertEquals(
+                listOf("'$token' in path $name"),
+                ReviewPackage.scanReviewerPackageForPrivateContent(mapOf(name to bytes), listOf(token)),
+            )
+        }
+    }
+
+    @Test
+    fun privacyScanDetectsForbiddenTokensInEveryUtf8TextFile() {
+        val forbidden = listOf("S01", "private-\u00e9-label")
+        for (name in listOf("review.html", "review.js", "review.css", "manifest.properties")) {
+            assertTrue(
+                ReviewPackage.scanReviewerPackageForPrivateContent(
+                    mapOf(name to "neutral".toByteArray(StandardCharsets.UTF_8)), forbidden,
+                ).isEmpty(),
+            )
+            val bytes = "prefix ${forbidden.joinToString(" ")} suffix".toByteArray(StandardCharsets.UTF_8)
+            assertEquals(
+                forbidden.map { "'$it' inside $name" },
+                ReviewPackage.scanReviewerPackageForPrivateContent(mapOf(name to bytes), forbidden),
+            )
+        }
+    }
+
+    @Test
+    fun privacyScanRejectsUnclassifiedGeneratedEntries() {
+        val png = onePixelPngWithUncompressedIdat()
+        for (name in listOf(
+            "review.txt", "manifest.properties.bak", "./review.html", "review.html/extra",
+            "assets/review.html", "other/p01.png", "assets/nested/p01.png", "assets\\p01.png",
+            "assets/p01.PNG", "assets/p01.png/extra", "assets/.png",
+        )) {
+            val error = assertThrows(ToolError::class.java) {
+                ReviewPackage.scanReviewerPackageForPrivateContent(mapOf(name to png), emptyList())
+            }
+            assertEquals("unclassified entry: $name", Codes.PRIVACY_LEAK, error.code)
+        }
+    }
+
+    @Test
+    fun privacyScanRejectsMalformedOrMetadataBearingPngAssets() {
+        val png = onePixelPngWithUncompressedIdat()
+        val invalidPngs = listOf(
+            byteArrayOf() to Codes.PNG_BAD_SIGNATURE,
+            png.copyOf(png.size - 1) to Codes.PNG_TRUNCATED,
+            TestData.pngWithTextMetadata("PRIVATE-LABEL") to Codes.PNG_ANCILLARY,
+        )
+        for ((bytes, expectedCode) in invalidPngs) {
+            val error = assertThrows(ToolError::class.java) {
+                ReviewPackage.scanReviewerPackageForPrivateContent(mapOf("assets/p01.png" to bytes), emptyList())
+            }
+            assertEquals(expectedCode, error.code)
+        }
     }
 
     @Test
@@ -263,6 +401,8 @@ class ReviewPackageTest {
             ReviewPackage.runBlind(root, pkg, key, "6666666666666666666666666666666666666666666666666666666666666666", 1200)
         }
         assertEquals(Codes.PRIVACY_LEAK, error.code)
+        assertTrue(Files.notExists(pkg, LinkOption.NOFOLLOW_LINKS))
+        assertTrue(Files.notExists(key, LinkOption.NOFOLLOW_LINKS))
     }
 
     @Test
