@@ -195,9 +195,13 @@ substitute for escape detection.
 - writes a package manifest hashing every reviewer-visible asset, the review
   page/script/style, the comparison-plan hash, the response-schema hash, and
   the private key hash;
-- proves by production inspection that the package contains no arm name,
-  source filename, private path, device/app identity, original hash, seed, or
-  key data;
+- checks every generated relative package path and the UTF-8 contents of
+  `review.html`, `review.js`, `review.css`, and `manifest.properties` for private
+  tokens before package or key writes. PNG privacy is enforced by fresh sRGB
+  rendering with no inherited metadata and strict no-ancillary-chunk validation
+  of every `assets/*.png` entry in the final privacy pass. Unclassified entries
+  fail closed. PNG pixel payloads are not scanned as text; this is not OCR or
+  proof that visible scene content lacks text;
 - never copies or mutates an original.
 
 ### HEIC / EXIF orientation limitation

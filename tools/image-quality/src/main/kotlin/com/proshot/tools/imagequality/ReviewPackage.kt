@@ -745,7 +745,7 @@ internal object ReviewPackage {
         allFiles["review.css"] = cssBytes
         allFiles["manifest.properties"] = manifestBytes
 
-        val leaks = scanForPrivateContent(allFiles, forbiddenTokens(dataset, seed, keyPath))
+        val leaks = scanReviewerPackageForPrivateContent(allFiles, forbiddenTokens(dataset, seed, keyPath))
         if (leaks.isNotEmpty()) {
             throw ToolError(Codes.PRIVACY_LEAK, "reviewer package would contain private labels: ${leaks.take(5).joinToString("; ")}")
         }
@@ -1340,12 +1340,29 @@ select, textarea, input { max-width: 100%; }
         return tokens.filter { it.isNotBlank() }.distinct().sorted()
     }
 
-    private fun scanForPrivateContent(files: Map<String, ByteArray>, forbidden: List<String>): List<String> {
+    /** Scans generated paths and UTF-8 text, validating PNG structure without treating pixels as text. */
+    internal fun scanReviewerPackageForPrivateContent(
+        files: Map<String, ByteArray>,
+        forbidden: List<String>,
+    ): List<String> {
         val found = mutableListOf<String>()
+        val pngAssetPath = Regex("assets/[^/\\\\]+\\.png")
         for ((name, bytes) in files) {
-            val text = String(bytes, StandardCharsets.ISO_8859_1)
+            val text = when (name) {
+                "review.html", "review.js", "review.css", "manifest.properties" -> String(bytes, StandardCharsets.UTF_8)
+                else -> {
+                    if (!pngAssetPath.matches(name)) {
+                        throw ToolError(Codes.PRIVACY_LEAK, "unclassified reviewer package entry: '$name'")
+                    }
+                    Png.validateChunks(bytes)
+                    null
+                }
+            }
             for (token in forbidden) {
-                if (token.isNotEmpty() && text.contains(token)) {
+                if (token.isNotEmpty() && name.contains(token)) {
+                    found += "'$token' in path $name"
+                }
+                if (token.isNotEmpty() && text != null && text.contains(token)) {
                     found += "'$token' inside $name"
                 }
             }
